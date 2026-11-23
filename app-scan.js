@@ -1,0 +1,968 @@
+/* WalletWeb — escáner de facturas: cámara propia, recorte automático, limpieza tipo escáner y PDF buscable.
+   Todo ocurre en el teléfono: no hay servidores ni librerías externas. */
+'use strict';
+
+/* ================= Procesamiento de imagen ================= */
+// Caja de desenfoque con imagen integral (O(n) sin importar el radio)
+function sBoxBlur(src, w, h, r) {
+  const I = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) { let row = 0; for (let x = 0; x < w; x++) { row += src[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + row; } }
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+      out[y * w + x] = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+    }
+  }
+  return out;
+}
+// Máximo / mínimo en ventana cuadrada (separable)
+function sMorph(src, w, h, r, isMax) {
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+  const pick = isMax ? Math.max : Math.min;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = src[y * w + x]; for (let k = Math.max(0, x - r); k <= Math.min(w - 1, x + r); k++) v = pick(v, src[y * w + k]); tmp[y * w + x] = v; }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = tmp[y * w + x]; for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r); k++) v = pick(v, tmp[k * w + x]); out[y * w + x] = v; }
+  return out;
+}
+// Piel (dedos) en espacio YCbCr: excluye papel blanco o amarillento
+function sIsSkin(r, g, b) {
+  const y = 0.299 * r + 0.587 * g + 0.114 * b;
+  const cb = 128 - 0.169 * r - 0.331 * g + 0.5 * b, cr = 128 + 0.5 * r - 0.419 * g - 0.081 * b;
+  return y > 50 && y < 240 && cr > 146 && cr < 182 && cb > 80 && cb < 128;
+}
+function sOtsu(hist, total) {
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sumB = 0, wB = 0, best = 0, t = 128;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (!wB) continue; const wF = total - wB; if (!wF) break;
+    sumB += i * hist[i]; const mB = sumB / wB, mF = (sum - sumB) / wF, v = wB * wF * (mB - mF) * (mB - mF);
+    if (v > best) { best = v; t = i; }
+  }
+  return t;
+}
+function sPolyArea(q) { let a = 0; for (let i = 0; i < 4; i++) { const [x1, y1] = q[i], [x2, y2] = q[(i + 1) % 4]; a += x1 * y2 - x2 * y1; } return Math.abs(a) / 2; }
+
+/* ---------- Detección del papel ----------
+   1) Balance de blancos automático: con luz cálida el papel se ve amarillo y se confundía con piel.
+   2) Se prueban varias "vistas" de la foto y varios umbrales:
+      · brillo · "blancura" (brillo menos color: separa el papel de mesas beige o manteles de colores)
+      · diferencia con el color del borde de la foto (el fondo)
+   3) Se elige la segmentación con mejor calidad: forma de cuadrilátero × contraste entre papel y fondo. */
+const _detCanvas = document.createElement('canvas');
+function sReadSmall(source, sw, sh, maxSide) {
+  const k = Math.min(1, maxSide / Math.max(sw, sh)), w = Math.max(16, Math.round(sw * k)), h = Math.max(16, Math.round(sh * k)), n = w * h;
+  _detCanvas.width = w; _detCanvas.height = h;
+  const ctx = _detCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(source, 0, 0, w, h);
+  return { d: ctx.getImageData(0, 0, w, h).data, w, h, n, k };
+}
+// Ganancias de balance de blancos a partir de lo más claro (normalmente el papel)
+function sWhiteGains(d, n) {
+  const lum = new Float32Array(n); for (let i = 0; i < n; i++) lum[i] = d[i * 4] + d[i * 4 + 1] + d[i * 4 + 2];
+  const s = Array.from(lum.filter((_, i) => !(i % 5))).sort((a, b) => a - b), t = s[Math.floor(s.length * 0.88)];
+  let r = 0, g = 0, b = 0, c = 0;
+  for (let i = 0; i < n; i++) if (lum[i] >= t && lum[i] < 760) { r += d[i * 4]; g += d[i * 4 + 1]; b += d[i * 4 + 2]; c++; }
+  if (!c) return [1, 1, 1];
+  const m = (r + g + b) / 3 / c, cl = v => Math.max(0.7, Math.min(2.2, v));
+  return [cl(m / (r / c)), cl(m / (g / c)), cl(m / (b / c))];
+}
+function sFeatures(d, w, h, gains) {
+  const n = w * h, gray = new Float32Array(n), white = new Float32Array(n), skin = new Uint8Array(n), R = new Float32Array(n), G = new Float32Array(n), B = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const r = Math.min(255, d[i * 4] * gains[0]), g = Math.min(255, d[i * 4 + 1] * gains[1]), b = Math.min(255, d[i * 4 + 2] * gains[2]);
+    R[i] = r; G[i] = g; B[i] = b;
+    const y = 0.299 * r + 0.587 * g + 0.114 * b; gray[i] = y;
+    white[i] = Math.max(0, y - 1.3 * (Math.max(r, g, b) - Math.min(r, g, b)));
+    skin[i] = sIsSkin(r, g, b) ? 1 : 0;
+  }
+  // color típico del borde de la foto (el fondo)
+  const br = [], bgc = [], bb = [];
+  const addB = i => { br.push(R[i]); bgc.push(G[i]); bb.push(B[i]); };
+  for (let x = 0; x < w; x += 2) { addB(x); addB((h - 1) * w + x); } for (let y = 0; y < h; y += 2) { addB(y * w); addB(y * w + w - 1); }
+  const med = a => { a.sort((x, y) => x - y); return a[a.length >> 1]; };
+  const mr = med(br), mg = med(bgc), mb = med(bb), diff = new Float32Array(n);
+  for (let i = 0; i < n; i++) diff[i] = Math.min(255, Math.hypot(R[i] - mr, G[i] - mg, B[i] - mb));
+  return { gray, white, diff, skin };
+}
+// Umbral → mayor región conectada (sin piel), cerrada y sin huecos
+function sSegment(F, thr, skin, w, h, rc, blurR) {
+  const n = w * h, Fb = blurR ? sBoxBlur(F, w, h, blurR) : F;
+  let m = new Float32Array(n); for (let i = 0; i < n; i++) m[i] = Fb[i] > thr && !skin[i] ? 1 : 0;
+  m = sMorph(sMorph(m, w, h, rc, true), w, h, rc, false);
+  const lab = new Int32Array(n), stack = new Int32Array(n);
+  let bestId = 0, bestArea = 0, id = 0;
+  for (let s = 0; s < n; s++) {
+    if (!m[s] || lab[s]) continue;
+    id++; let sp = 0, area = 0; stack[sp++] = s; lab[s] = id;
+    while (sp) { const p = stack[--sp]; area++; const x = p % w, y = (p / w) | 0;
+      if (x > 0 && m[p - 1] && !lab[p - 1]) { lab[p - 1] = id; stack[sp++] = p - 1; }
+      if (x < w - 1 && m[p + 1] && !lab[p + 1]) { lab[p + 1] = id; stack[sp++] = p + 1; }
+      if (y > 0 && m[p - w] && !lab[p - w]) { lab[p - w] = id; stack[sp++] = p - w; }
+      if (y < h - 1 && m[p + w] && !lab[p + w]) { lab[p + w] = id; stack[sp++] = p + w; } }
+    if (area > bestArea) { bestArea = area; bestId = id; }
+  }
+  const pm = new Uint8Array(n); if (!bestId) return { pm, area: 0, touch: 0, Fb };
+  for (let p = 0; p < n; p++) if (lab[p] === bestId) pm[p] = 1;
+  // huecos (texto, sombras dentro del papel): todo lo que no se alcanza desde el marco por fuera del papel
+  const out = new Uint8Array(n); let sp = 0;
+  const seed = q => { if (!pm[q] && !out[q]) { out[q] = 1; stack[sp++] = q; } };
+  for (let x = 0; x < w; x++) { seed(x); seed((h - 1) * w + x); } for (let y = 0; y < h; y++) { seed(y * w); seed(y * w + w - 1); }
+  while (sp) { const p = stack[--sp], x = p % w, y = (p / w) | 0;
+    if (x > 0) seed(p - 1); if (x < w - 1) seed(p + 1); if (y > 0) seed(p - w); if (y < h - 1) seed(p + w); }
+  let area = 0, touch = 0;
+  for (let p = 0; p < n; p++) { pm[p] = out[p] ? 0 : 1; if (pm[p]) { area++; const x = p % w, y = (p / w) | 0; if (x === 0 || y === 0 || x === w - 1 || y === h - 1) touch++; } }
+  return { pm, area, touch, Fb };
+}
+// Esquinas: puntos extremos del contorno en 16 direcciones → cuadrilátero de mayor área
+function sQuadFromMask(pm, w, h) {
+  const dirs = []; for (let a = 0; a < 16; a++) { const th = a * Math.PI / 8; dirs.push([Math.cos(th), Math.sin(th)]); }
+  const best = dirs.map(() => ({ v: -Infinity, p: null }));
+  for (let p = 0; p < pm.length; p++) {
+    if (!pm[p]) continue; const x = p % w, y = (p / w) | 0;
+    if (x > 0 && x < w - 1 && y > 0 && y < h - 1 && pm[p - 1] && pm[p + 1] && pm[p - w] && pm[p + w]) continue;
+    for (let j = 0; j < 16; j++) { const v = x * dirs[j][0] + y * dirs[j][1]; if (v > best[j].v) { best[j].v = v; best[j].p = [x + 0.5, y + 0.5]; } }
+  }
+  const cand = best.map(b => b.p); if (cand.some(c => !c)) return null;
+  let bq = null, ba = -1;
+  for (let a = 0; a < 16; a++) for (let b = a + 1; b < 16; b++) for (let c = b + 1; c < 16; c++) for (let e = c + 1; e < 16; e++) {
+    const q = [cand[a], cand[b], cand[c], cand[e]], ar = sPolyArea(q); if (ar > ba) { ba = ar; bq = q; }
+  }
+  const cx = bq.reduce((s, p) => s + p[0], 0) / 4, cy = bq.reduce((s, p) => s + p[1], 0) / 4;
+  bq.sort((p, q) => Math.atan2(p[1] - cy, p[0] - cx) - Math.atan2(q[1] - cy, q[0] - cx));
+  let st = 0, sb = Infinity; bq.forEach((p, i) => { const s = p[0] + p[1]; if (s < sb) { sb = s; st = i; } });
+  return { q: [0, 1, 2, 3].map(i => bq[(st + i) % 4]), area: ba };
+}
+// Contraste papel/fondo: media del papel (sin su orilla) contra una franja justo afuera, en la vista usada
+function sSeparation(Fb, pm, w, h, range) {
+  const n = w * h, rr = Math.max(2, Math.round(Math.min(w, h) * 0.02)), pf = Float32Array.from(pm);
+  const ero = sMorph(pf, w, h, rr, false), dil = sMorph(pf, w, h, rr * 2, true);
+  let si = 0, ci = 0, so = 0, co = 0;
+  for (let p = 0; p < n; p++) { if (ero[p]) { si += Fb[p]; ci++; } else if (dil[p] && !pm[p]) { so += Fb[p]; co++; } }
+  if (!ci || !co) return 0;
+  return (si / ci - so / co) / Math.max(10, range);
+}
+// Nitidez del borde: cambio de brillo promedio justo en el contorno (un borde de papel es un salto; la luz desigual es gradual)
+function sEdgeSharpness(Fb, pm, w, h, range) {
+  let s = 0, c = 0;
+  for (let y = 2; y < h - 2; y++) for (let x = 2; x < w - 2; x++) {
+    const p = y * w + x; if (!pm[p]) continue;
+    if (pm[p - 1] && pm[p + 1] && pm[p - w] && pm[p + w]) continue;
+    const gx = Fb[p + 2] - Fb[p - 2], gy = Fb[p + 2 * w] - Fb[p - 2 * w]; s += Math.hypot(gx, gy) / 4; c++;
+  }
+  return c ? s / c / Math.max(10, range) : 0;
+}
+function sEvalSeg(seg, w, h, range) {
+  const n = w * h;
+  if (!seg.area || seg.area < n * 0.04 || seg.area > n * 0.93) return { quality: 0 };
+  if (seg.touch > (w + h) * 1.2) return { quality: 0 }; // toca casi todo el marco
+  const qd = sQuadFromMask(seg.pm, w, h); if (!qd) return { quality: 0 };
+  const rect = Math.min(1, seg.area / qd.area), sep = sSeparation(seg.Fb, seg.pm, w, h, range), sharp = sEdgeSharpness(seg.Fb, seg.pm, w, h, range);
+  // contraste y nitidez mínimos: con la hoja llenando la foto o con luz desigual no hay borde real
+  const quality = rect * Math.max(0, Math.min(1, (sep - 0.28) / 0.17)) * Math.max(0, Math.min(1, (sharp - 0.04) / 0.035)) * (seg.area > n * 0.85 ? 0.7 : 1);
+  return { quality, rect, sep, sharp, qd };
+}
+const _vlist = ['white', 'gray', 'diff'];
+function scanDetect(source, sw, sh, maxSide) {
+  maxSide = maxSide || 360;
+  // Paso 1: elegir vista y umbral a baja resolución
+  const S = sReadSmall(source, sw, sh, 360), gains = sWhiteGains(S.d, S.n), Fs = sFeatures(S.d, S.w, S.h, gains);
+  const sc0 = S.w / 360, rc0 = Math.max(2, Math.round(2 * sc0)), bl0 = Math.max(1, Math.round(2 * sc0));
+  const cands = [];
+  for (const vname of _vlist) {
+    const F = Fs[vname], Fb = sBoxBlur(F, S.w, S.h, bl0);
+    const hist = new Uint32Array(256); for (let i = 0; i < S.n; i++) hist[Math.max(0, Math.min(255, Fb[i] | 0))]++;
+    const sv = Array.from(Fb.filter((_, i) => !(i % 7))).sort((a, b) => a - b), range = sv[Math.floor(sv.length * 0.97)] - sv[Math.floor(sv.length * 0.03)];
+    const t = sOtsu(hist, S.n);
+    let s0 = 0, c0 = 0, s1 = 0, c1 = 0; for (let i = 0; i < 256; i++) { if (i <= t) { s0 += i * hist[i]; c0 += hist[i]; } else { s1 += i * hist[i]; c1 += hist[i]; } }
+    const mu0 = c0 ? s0 / c0 : 0, mu1 = c1 ? s1 / c1 : 255;
+    const thrs = [t, mu0 + 0.3 * (mu1 - mu0)];
+    if (vname === 'gray') thrs.push(Math.pow(Math.max(8, mu0), 0.7) * Math.pow(mu1, 0.3)); // sombras profundas
+    for (const thr of thrs) {
+      if (!(thr > 0)) continue;
+      const seg = sSegment(F, thr, Fs.skin, S.w, S.h, rc0, bl0), ev = sEvalSeg(seg, S.w, S.h, range);
+      if (ev.quality > 0) cands.push({ vname, thr, seg, ev, range });
+    }
+  }
+  if (!cands.length) return null;
+  // Entre las de calidad casi máxima se elige la que abarca más papel (no deja por fuera la parte en sombra)
+  const top = cands.reduce((a, b) => (b.ev.quality > a.ev.quality ? b : a));
+  let best = top;
+  for (const c of cands.slice().sort((a, b) => a.seg.area - b.seg.area)) if (c.ev.quality >= top.ev.quality - 0.05 && c.ev.rect >= top.ev.rect - 0.03 && c.seg.touch <= top.seg.touch + 2 && c.seg.area > best.seg.area * 1.04 && c.seg.area <= top.seg.area * 1.5) best = c;
+  // Paso 2: misma vista y umbral a la resolución pedida (máscara más fina para medir bordes curvos)
+  let w = S.w, h = S.h, k = S.k, seg = best.seg, qd = best.ev.qd;
+  if (maxSide > 360) {
+    const B = sReadSmall(source, sw, sh, maxSide), FB = sFeatures(B.d, B.w, B.h, gains), sc = B.w / 360;
+    const s2 = sSegment(FB[best.vname], best.thr, FB.skin, B.w, B.h, Math.max(2, Math.round(2 * sc)), Math.max(1, Math.round(2 * sc)));
+    const q2 = s2.area ? sQuadFromMask(s2.pm, B.w, B.h) : null;
+    const expA = seg.area * (B.n / S.n);
+    if (q2 && s2.area > expA * 0.8 && s2.area < expA * 1.2) { w = B.w; h = B.h; k = B.k; seg = s2; qd = q2; }
+  }
+  const quad = qd.q.map(([x, y]) => [x / k, y / k]), n = w * h;
+  const cover = seg.area / n, rect = Math.min(1, seg.area / qd.area);
+  return { quad, score: rect * Math.min(1, best.ev.quality / Math.max(0.01, best.ev.rect) + 0.15), cover, edgeRatio: best.ev.sep, view: best.vname, mask: { m: seg.pm, w, h, k, F: seg.Fb } };
+}
+function scanFullQuad(w, h) { const m = Math.min(w, h) * 0.01; return [[m, m], [w - m, m], [w - m, h - m], [m, h - m]]; } // sin bordes visibles: toda la foto
+function scanDefaultQuad(w, h) { const mx = w * 0.06, my = h * 0.06; return [[mx, my], [w - mx, my], [w - mx, h - my], [mx, h - my]]; }
+
+// Homografía: lleva src (4 puntos) a dst (4 puntos)
+function sHomography(src, dst) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const [x, y] = src[i], [u, v] = dst[i];
+    A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+    A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+  }
+  for (let c = 0; c < 8; c++) {
+    let p = c; for (let r = c + 1; r < 8; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    [A[c], A[p]] = [A[p], A[c]]; [b[c], b[p]] = [b[p], b[c]];
+    for (let r = 0; r < 8; r++) { if (r === c) continue; const f = A[r][c] / A[c][c]; for (let k = c; k < 8; k++) A[r][k] -= f * A[c][k]; b[r] -= f * b[c]; }
+  }
+  return b.map((v, i) => v / A[i][i]);
+}
+const UNIT = [[0, 0], [1, 0], [1, 1], [0, 1]];
+function sApplyH(H, x, y) { const z = H[6] * x + H[7] * y + 1; return [(H[0] * x + H[1] * y + H[2]) / z, (H[3] * x + H[4] * y + H[5]) / z]; }
+
+/* Bordes curvos. La factura se describe con sus 4 esquinas (homografía) más cuánto se desvía cada borde
+   de la línea recta, medido en el plano "enderezado" (0..1). curve = { t, r, b, l } con CURVE_N muestras.
+   top: y = t[i]   right: x = 1 + r[i]   bottom: y = 1 + b[i]   left: x = l[i]   (i recorre el borde de 0 a 1) */
+const CURVE_N = 33;
+function curveZero() { const z = () => new Array(CURVE_N).fill(0); return { t: z(), r: z(), b: z(), l: z() }; }
+function curveSample(arr, s) { const f = Math.max(0, Math.min(1, s)) * (CURVE_N - 1), i = Math.min(CURVE_N - 2, Math.floor(f)), a = f - i; return arr[i] * (1 - a) + arr[i + 1] * a; }
+// Punto (u, v) del plano enderezado → posición dentro del contorno curvo (parche de Coons)
+function coons(curve, u, v) {
+  return [u + (1 - u) * curveSample(curve.l, v) + u * curveSample(curve.r, v), v + (1 - v) * curveSample(curve.t, u) + v * curveSample(curve.b, u)];
+}
+// Mide los bordes reales sobre la máscara del papel (rayos desde afuera hacia adentro)
+function scanCurve(det) { return scanRefine(det).curve; }
+// Mide los bordes reales: rayos desde afuera hacia adentro sobre la máscara del papel; luego cada punto se
+// "pega" al cambio de brillo más fuerte cercano (borde verdadero, más preciso que la máscara).
+// Primera pasada: corrige las esquinas con lo medido. Segunda: mide la curvatura respecto a las esquinas nuevas.
+function scanRefine(det) {
+  if (!det || !det.mask) return { quad: det ? det.quad : null, curve: curveZero() };
+  const { m, w, h, k, F } = det.mask;
+  const R = 0.18, steps = 120, stepO = 2 * R / steps;
+  const pass = (quad, pin) => {
+    const c = curveZero(), H = sHomography(UNIT, quad);
+    const toPx = (u, v) => { const [x, y] = sApplyH(H, u, v); return [x * k - 0.5, y * k - 0.5]; };
+    const at = (u, v) => { const [x, y] = toPx(u, v), px = Math.round(x), py = Math.round(y); return px >= 0 && py >= 0 && px < w && py < h ? m[py * w + px] : 0; };
+    const fAt = (u, v) => { const [x, y] = toPx(u, v); if (x < 0 || y < 0 || x >= w - 1 || y >= h - 1) return NaN; const x0 = x | 0, y0 = y | 0, ax = x - x0, ay = y - y0, i = y0 * w + x0; return (F[i] * (1 - ax) + F[i + 1] * ax) * (1 - ay) + (F[i + w] * (1 - ax) + F[i + w + 1] * ax) * ay; };
+    const measure = (pt, dir) => {
+      const out = [];
+      for (let i = 0; i < CURVE_N; i++) {
+        const s = i / (CURVE_N - 1); let j0 = -1;
+        for (let j = 0; j <= steps; j++) { const o = dir * (-R + stepO * j); const [u, v] = pt(s, o); if (at(u, v)) { j0 = j; break; } }
+        if (j0 < 0) { out.push(NaN); continue; }
+        let bj = j0, bd = 0;
+        if (F) for (let j = Math.max(2, j0 - 8); j <= Math.min(steps - 2, j0 + 8); j++) {
+          const [u1, v1] = pt(s, dir * (-R + stepO * (j - 2))), [u2, v2] = pt(s, dir * (-R + stepO * (j + 2)));
+          const dlt = fAt(u2, v2) - fAt(u1, v1); if (dlt > bd) { bd = dlt; bj = j; }
+        }
+        out.push(dir * (-R + stepO * (bd > 10 ? bj : j0)));
+      }
+      return out;
+    };
+    const raw = { t: measure((s, o) => [s, o], 1), b: measure((s, o) => [s, 1 + o], -1), l: measure((s, o) => [o, s], 1), r: measure((s, o) => [1 + o, s], -1) };
+    const ends = {};
+    for (const key of ['t', 'r', 'b', 'l']) {
+      let a = raw[key];
+      const ok = a.map(v => Number.isFinite(v)); if (ok.filter(Boolean).length < CURVE_N / 3) { ends[key] = [0, 0]; continue; }
+      for (let i = 0; i < CURVE_N; i++) if (!ok[i]) { let p = i - 1, q = i + 1; while (p >= 0 && !ok[p]) p--; while (q < CURVE_N && !ok[q]) q++; a[i] = p < 0 ? a[q] : q >= CURVE_N ? a[p] : a[p] + (a[q] - a[p]) * (i - p) / (q - p); }
+      const med = a.map((_, i) => { const win = []; for (let j = Math.max(0, i - 3); j <= Math.min(CURVE_N - 1, i + 3); j++) win.push(a[j]); win.sort((x, y) => x - y); return win[win.length >> 1]; });
+      a = med.map((v, i) => { const lo = med[Math.max(0, i - 4)], hi = med[Math.min(CURVE_N - 1, i + 4)], ref = (lo + hi) / 2; const inward = key === 't' || key === 'l' ? v - ref : ref - v; return inward > 0.025 ? ref : v; });
+      const sm = a.map((_, i) => { let s = 0, n = 0; for (let j = Math.max(0, i - 2); j <= Math.min(CURVE_N - 1, i + 2); j++) { s += a[j]; n++; } return s / n; });
+      // extremos: se extrapola con una recta por las muestras 2..6 (la esquina misma suele estar redondeada)
+      const ext = (i0, i1, at0) => { let sx = 0, sy = 0, sxx = 0, sxy = 0, nn = 0; for (let i = i0; i <= i1; i++) { sx += i; sy += sm[i]; sxx += i * i; sxy += i * sm[i]; nn++; } const sl = (nn * sxy - sx * sy) / Math.max(1e-9, nn * sxx - sx * sx); return (sy - sl * sx) / nn + sl * at0; };
+      ends[key] = [ext(2, 6, 0), ext(CURVE_N - 7, CURVE_N - 3, CURVE_N - 1)];
+      if (pin) { const a0 = sm[0], a1 = sm[CURVE_N - 1]; c[key] = sm.map((v, i) => { const r = v - (a0 + (a1 - a0) * i / (CURVE_N - 1)); return Math.max(-0.16, Math.min(0.16, Math.abs(r) < 0.002 ? 0 : r)); }); }
+    }
+    return { c, ends, H };
+  };
+  const p1 = pass(det.quad, false), e = p1.ends, cl = v => Math.max(-0.06, Math.min(0.06, v));
+  const nq = [[cl(e.l[0]), cl(e.t[0])], [1 + cl(e.r[0]), cl(e.t[1])], [1 + cl(e.r[1]), 1 + cl(e.b[1])], [cl(e.l[1]), 1 + cl(e.b[0])]].map(([u, v]) => sApplyH(p1.H, u, v));
+  const quad = sPolyArea(nq) > sPolyArea(det.quad) * 0.8 ? nq : det.quad;
+  return { quad, curve: pass(quad, true).c };
+}
+// Puntos del contorno (para dibujarlo) en coordenadas de la fuente
+function curveOutline(quad, curve, per) {
+  const H = sHomography(UNIT, quad), pts = [], N = per || 24;
+  const push = (u, v) => { const [x, y] = coons(curve, u, v); pts.push(sApplyH(H, x, y)); };
+  for (let i = 0; i < N; i++) push(i / N, 0);
+  for (let i = 0; i < N; i++) push(1, i / N);
+  for (let i = N; i > 0; i--) push(i / N, 1);
+  for (let i = N; i > 0; i--) push(0, i / N);
+  return pts;
+}
+function curveRotate(c) { // giro de 90° a la derecha (igual que scanRotate)
+  const rev = a => a.slice().reverse(), neg = a => a.map(v => -v);
+  return { t: rev(c.l), r: neg(c.t), b: rev(c.r), l: neg(c.b) };
+}
+function sCurveLen(quad, curve, edge) {
+  const H = sHomography(UNIT, quad); let L = 0, prev = null;
+  for (let i = 0; i <= 40; i++) { const s = i / 40, uv = edge === 't' ? [s, 0] : edge === 'b' ? [s, 1] : edge === 'l' ? [0, s] : [1, s];
+    const [x, y] = coons(curve, uv[0], uv[1]), p = sApplyH(H, x, y); if (prev) L += Math.hypot(p[0] - prev[0], p[1] - prev[1]); prev = p; }
+  return L;
+}
+// Recorte: lleva el contorno (esquinas + bordes curvos) a un rectángulo
+function scanWarp(srcCanvas, quad, maxSide, curve) {
+  curve = curve || curveZero();
+  let W = Math.max(sCurveLen(quad, curve, 't'), sCurveLen(quad, curve, 'b')), H = Math.max(sCurveLen(quad, curve, 'l'), sCurveLen(quad, curve, 'r'));
+  const s = Math.min(1, (maxSide || 2200) / Math.max(W, H)); W = Math.max(40, Math.round(W * s)); H = Math.max(40, Math.round(H * s));
+  const Hm = sHomography(UNIT, quad);
+  const sw = srcCanvas.width, sh = srcCanvas.height;
+  const sd = srcCanvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, sw, sh).data;
+  const out = document.createElement('canvas'); out.width = W; out.height = H;
+  const octx = out.getContext('2d'); const od = octx.createImageData(W, H); const o = od.data;
+  // desvíos precalculados por columna (bordes de arriba/abajo) y por fila (izquierda/derecha)
+  const ct = new Float32Array(W), cb = new Float32Array(W), cl = new Float32Array(H), cr = new Float32Array(H);
+  for (let u = 0; u < W; u++) { const s = (u + 0.5) / W; ct[u] = curveSample(curve.t, s); cb[u] = curveSample(curve.b, s); }
+  for (let v = 0; v < H; v++) { const s = (v + 0.5) / H; cl[v] = curveSample(curve.l, s); cr[v] = curveSample(curve.r, s); }
+  for (let v = 0; v < H; v++) {
+    const vv = (v + 0.5) / H;
+    for (let u = 0; u < W; u++) {
+      const uu = (u + 0.5) / W, px = uu + (1 - uu) * cl[v] + uu * cr[v], py = vv + (1 - vv) * ct[u] + vv * cb[u];
+      const z = Hm[6] * px + Hm[7] * py + 1, x = (Hm[0] * px + Hm[1] * py + Hm[2]) / z - 0.5, y = (Hm[3] * px + Hm[4] * py + Hm[5]) / z - 0.5;
+      const x0 = Math.max(0, Math.min(sw - 2, Math.floor(x))), y0 = Math.max(0, Math.min(sh - 2, Math.floor(y))), fx = Math.max(0, Math.min(1, x - x0)), fy = Math.max(0, Math.min(1, y - y0));
+      const i00 = (y0 * sw + x0) * 4, i10 = i00 + 4, i01 = i00 + sw * 4, i11 = i01 + 4, oi = (v * W + u) * 4;
+      for (let c = 0; c < 3; c++) o[oi + c] = (sd[i00 + c] * (1 - fx) + sd[i10 + c] * fx) * (1 - fy) + (sd[i01 + c] * (1 - fx) + sd[i11 + c] * fx) * fy;
+      o[oi + 3] = 255;
+    }
+  }
+  octx.putImageData(od, 0, 0);
+  return out;
+}
+
+/* Enderezar el texto (giro): aunque el papel quede derecho, el texto puede venir inclinado (foto ya recortada,
+   tirilla mal impresa o recorte manual). Se busca el ángulo en el que los renglones dan un perfil horizontal
+   más "nítido" (suma de cuadrados de la proyección) y se gira la imagen ese ángulo. */
+function scanDeskew(canvas) {
+  const W = canvas.width, H = canvas.height;
+  const k = Math.min(1, 700 / Math.max(W, H)), w = Math.max(16, Math.round(W * k)), h = Math.max(16, Math.round(H * k)), n = w * h;
+  const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = h;
+  const tc = tmp.getContext('2d', { willReadFrequently: true }); tc.drawImage(canvas, 0, 0, w, h);
+  const d = tc.getImageData(0, 0, w, h).data, g = new Float32Array(n);
+  for (let i = 0; i < n; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  const bg = sBoxBlur(sMorph(g, w, h, 5, true), w, h, 6);
+  const xs = [], ys = [], ws = [];
+  const mg = Math.round(Math.min(w, h) * 0.03); // se ignora el borde (restos de la mesa)
+  const inkM = new Float32Array(n);
+  for (let y = mg; y < h - mg; y++) for (let x = mg; x < w - mg; x++) { const i = y * w + x; if (g[i] / Math.max(20, bg[i]) < 0.55) inkM[i] = 1; }
+  sCleanLongStrokes(inkM, w, h); // los dobleces son líneas largas: no deben decidir el ángulo
+  for (let i = 0; i < n; i++) if (inkM[i]) { xs.push((i % w) - w / 2); ys.push(((i / w) | 0) - h / 2); ws.push(1); }
+  if (xs.length < 200) return { canvas, angle: 0 };
+  const D = Math.ceil(Math.hypot(w, h)) + 2, prof = new Float32Array(D);
+  const score = deg => {
+    const a = deg * Math.PI / 180, s = Math.sin(a), c = Math.cos(a); prof.fill(0);
+    for (let i = 0; i < xs.length; i++) { const yy = -xs[i] * s + ys[i] * c + D / 2; const y0 = Math.floor(yy), f = yy - y0; if (y0 >= 0 && y0 < D - 1) { prof[y0] += ws[i] * (1 - f); prof[y0 + 1] += ws[i] * f; } }
+    let e = 0; for (let i = 0; i < D; i++) e += prof[i] * prof[i]; return e;
+  };
+  let best = 0, bs = score(0);
+  for (let a = -40; a <= 40; a += 1) { const s = score(a); if (s > bs) { bs = s; best = a; } }
+  for (let a = best - 1; a <= best + 1.001; a += 0.1) { const s = score(a); if (s > bs) { bs = s; best = a; } }
+  // solo si el ángulo da un perfil claramente mejor que sin girar
+  if (Math.abs(best) < 0.35 || bs < score(0) * 1.08) return { canvas, angle: 0 };
+  const a = best * Math.PI / 180, cs = Math.abs(Math.cos(a)), sn = Math.abs(Math.sin(a));
+  const NW = Math.round(W * cs + H * sn), NH = Math.round(W * sn + H * cs);
+  // color del papel (para rellenar las esquinas nuevas)
+  const sd = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data, ch = [[], [], []];
+  for (let i = 0; i < W * H; i += 97) for (let c = 0; c < 3; c++) ch[c].push(sd[i * 4 + c]);
+  const paper = ch.map(v => { v.sort((x, y) => x - y); return v[Math.floor(v.length * 0.9)]; });
+  const out = document.createElement('canvas'); out.width = NW; out.height = NH;
+  const oc = out.getContext('2d'); oc.fillStyle = `rgb(${paper.join(',')})`; oc.fillRect(0, 0, NW, NH);
+  oc.imageSmoothingQuality = 'high'; oc.translate(NW / 2, NH / 2); oc.rotate(-a); oc.drawImage(canvas, -W / 2, -H / 2);
+  return { canvas: out, angle: best };
+}
+
+/* Enderezar renglones: aunque el borde quede recto, un papel abombado, doblado u ondulado (en "S") deja los
+   renglones curvos. Se calculan dos correcciones y se compara qué tan nítidos quedan los renglones
+   (perfil horizontal de tinta) con cada una y sin ninguna; se aplica solo la que mejora:
+   A) Registro por franjas: cada franja vertical se alinea con el promedio de todas (iterativo, sigue
+      ondas de cualquier forma, también en S).
+   B) Modelo suave (polinomio) a partir de comparar franjas vecinas: bueno para curvas amplias. */
+function sInkSmall(canvas, Wd) {
+  const W = canvas.width, H = canvas.height; Wd = Math.min(Wd, W);
+  const f = W / Wd, Hd = Math.max(20, Math.round(H / f)), nd = Wd * Hd;
+  const tmp = document.createElement('canvas'); tmp.width = Wd; tmp.height = Hd;
+  const tctx = tmp.getContext('2d', { willReadFrequently: true }); tctx.drawImage(canvas, 0, 0, Wd, Hd);
+  const dd = tctx.getImageData(0, 0, Wd, Hd).data, g = new Float32Array(nd);
+  for (let i = 0; i < nd; i++) g[i] = 0.299 * dd[i * 4] + 0.587 * dd[i * 4 + 1] + 0.114 * dd[i * 4 + 2];
+  const bg = sBoxBlur(sMorph(g, Wd, Hd, 4, true), Wd, Hd, 5);
+  const ink = new Float32Array(nd); for (let i = 0; i < nd; i++) ink[i] = Math.max(0, Math.min(1, (0.78 - g[i] / Math.max(20, bg[i])) / 0.4));
+  // dobleces y separadores largos no deben guiar la corrección
+  const strong = new Float32Array(nd); for (let i = 0; i < nd; i++) strong[i] = ink[i] > 0.5 ? 1 : 0;
+  const keep = strong.slice(); sCleanLongStrokes(keep, Wd, Hd);
+  for (let i = 0; i < nd; i++) if (strong[i] && !keep[i]) ink[i] = 0;
+  return { ink, Wd, Hd, f };
+}
+// Nitidez de renglones: con renglones rectos el perfil horizontal tiene picos altos y valles limpios
+function sRowSharpness(ink, Wd, Hd, dyAt) {
+  const prof = new Float32Array(Hd + 2); let tot = 0;
+  for (let y = 0; y < Hd; y++) for (let x = 0; x < Wd; x++) {
+    const v = ink[y * Wd + x]; if (!v) continue;
+    const yy = dyAt ? y - dyAt(x, y) : y; const y0 = Math.floor(yy), fr = yy - y0; if (y0 < 0 || y0 >= Hd) continue;
+    prof[y0] += v * (1 - fr); prof[y0 + 1] += v * fr; tot += v;
+  }
+  let e = 0; for (let y = 0; y < prof.length; y++) e += prof[y] * prof[y];
+  return tot ? e / (tot * tot) * Hd : 0;
+}
+function scanStraighten(canvas) {
+  const W = canvas.width, H = canvas.height;
+  const { ink, Wd, Hd, f } = sInkSmall(canvas, 400);
+  const S = 12, sw = Wd / S;
+  const P = []; for (let s = 0; s < S; s++) { const x0 = Math.round(s * sw), x1 = Math.round((s + 1) * sw), p = new Float32Array(Hd);
+    for (let y = 0; y < Hd; y++) { let t = 0; for (let x = x0; x < x1; x++) t += ink[y * Wd + x]; p[y] = t / (x1 - x0); }
+    const q = new Float32Array(Hd); for (let y = 0; y < Hd; y++) q[y] = (p[Math.max(0, y - 1)] + 2 * p[y] + p[Math.min(Hd - 1, y + 1)]) / 4; P.push(q); }
+  // interlineado por autocorrelación del perfil total
+  const T = new Float32Array(Hd); P.forEach(p => { for (let y = 0; y < Hd; y++) T[y] += p[y]; });
+  let mT = 0; for (let y = 0; y < Hd; y++) mT += T[y]; mT /= Hd;
+  let L = Math.round(Hd / 25), bestAc = -Infinity, prevAc = Infinity, rising = false;
+  for (let lag = 4; lag < Hd / 5; lag++) { let a = 0; for (let y = 0; y + lag < Hd; y++) a += (T[y] - mT) * (T[y + lag] - mT); a /= (Hd - lag);
+    if (a > prevAc) rising = true; if (rising && a > bestAc) { bestAc = a; L = lag; } if (rising && a < bestAc * 0.7) break; prevAc = a; }
+  L = Math.max(5, L);
+  const step = Math.max(3, Math.round(L * 0.8)), half = Math.round(L * 1.6);
+  const nb = Math.max(1, Math.ceil(Hd / step));
+  const sampleP = (p, y) => { const y0 = Math.floor(y), fr = y - y0; if (y0 < 0 || y0 >= Hd - 1) return 0; return p[y0] * (1 - fr) + p[y0 + 1] * fr; };
+  // grilla → función de desplazamiento (píxeles reducidos); nodos en centros de franja y de banda
+  const gridFn = G => (x, y) => {
+    const fs = Math.max(0, Math.min(S - 1.001, x / sw - 0.5)), s0 = Math.floor(fs), a = fs - s0;
+    const fj = Math.max(0, Math.min(nb - 1.001, (y - step / 2) / step)), j0 = Math.floor(fj), b = fj - j0, A0 = G[j0], A1 = G[Math.min(nb - 1, j0 + 1)];
+    return (A0[s0] * (1 - a) + A0[s0 + 1] * a) * (1 - b) + (A1[s0] * (1 - a) + A1[s0 + 1] * a) * b;
+  };
+  // energía de tinta por banda y franja
+  const E = [], Emax = [];
+  for (let j = 0; j < nb; j++) { const yc = j * step + step / 2, y0 = Math.max(0, Math.round(yc - half)), y1 = Math.min(Hd, Math.round(yc + half));
+    const e = P.map(p => { let t = 0; for (let y = y0; y < y1; y++) t += p[y]; return t; }); E.push(e); Emax.push(Math.max(...e)); }
+  const fnA = null;
+  /* ---- B) modelo suave a partir de franjas vecinas ---- */
+  const obs = [];
+  for (let j = 0; j < nb; j++) {
+    const yc = j * step + step / 2, y0 = Math.max(0, Math.round(yc - half)), y1 = Math.min(Hd, Math.round(yc + half));
+    const inked = []; E[j].forEach((e, s) => { if (Emax[j] > 0.6 && e > Emax[j] * 0.2) inked.push(s); });
+    for (let i = 1; i < inked.length; i++) {
+      const a = inked[i - 1], b = inked[i], lm = Math.min(L * 0.7, L * 0.42 * Math.min(2, b - a));
+      let best = 0, bv = -Infinity; const sc = [];
+      for (let dlt = -Math.ceil(lm); dlt <= Math.ceil(lm); dlt++) {
+        let num = 0, da = 0, db = 0;
+        for (let y = y0; y < y1; y++) { const yb = y + dlt; if (yb < 0 || yb >= Hd) continue; num += P[a][y] * P[b][yb]; da += P[a][y] * P[a][y]; db += P[b][yb] * P[b][yb]; }
+        const v = da && db ? num / Math.sqrt(da * db) : 0; sc.push(v); if (v > bv) { bv = v; best = dlt; }
+      }
+      if (bv < 0.5 || Math.abs(best) >= Math.ceil(lm)) continue;
+      const ci = best + Math.ceil(lm); let sub = best;
+      if (ci > 0 && ci < sc.length - 1) { const l = sc[ci - 1], c0 = sc[ci], r = sc[ci + 1], den = l - 2 * c0 + r; if (den < 0) sub = best + 0.5 * (l - r) / den; }
+      obs.push({ xa: ((a + 0.5) / S) * 2 - 1, xb: ((b + 0.5) / S) * 2 - 1, y: (yc / Hd) * 2 - 1, d: sub, w: bv });
+    }
+  }
+  let fnB = null;
+  if (obs.length >= 10) {
+    // con muchas observaciones se permite un modelo más flexible (ondas en S que cambian a lo largo de la factura)
+    const DX = obs.length > 120 ? 4 : 3, DY = obs.length > 120 ? 3 : 2;
+    const basis = (x, y) => { const r = []; for (let i = 1; i <= DX; i++) for (let m = 0; m <= DY; m++) r.push(Math.pow(x, i) * Math.pow(y, m)); return r; };
+    const K = DX * (DY + 1); let coef = null;
+    const rows = obs.map(o => { const pa = basis(o.xa, o.y), pb = basis(o.xb, o.y); return pb.map((v, k) => v - pa[k]); });
+    let wts = obs.map(o => o.w);
+    for (let it = 0; it < 4; it++) {
+      const A = Array.from({ length: K }, () => new Array(K).fill(0)), bb = new Array(K).fill(0);
+      rows.forEach((r, i) => { const wv = wts[i]; for (let p = 0; p < K; p++) { bb[p] += wv * r[p] * obs[i].d; for (let q = 0; q < K; q++) A[p][q] += wv * r[p] * r[q]; } });
+      for (let p = 0; p < K; p++) A[p][p] += 1e-3 * obs.length;
+      coef = sSolve(A, bb); if (!coef) break;
+      const res = rows.map((r, i) => obs[i].d - r.reduce((s, v, k) => s + v * coef[k], 0));
+      const mad = res.map(Math.abs).sort((x, y) => x - y)[res.length >> 1] || 0.5;
+      wts = res.map((e, i) => obs[i].w / (1 + Math.pow(e / (2.5 * Math.max(0.3, mad)), 2)));
+    }
+    if (coef) fnB = (x, y) => Math.max(-0.12 * Hd, Math.min(0.12 * Hd, basis((x / Wd) * 2 - 1, (y / Hd) * 2 - 1).reduce((s, v, k) => s + v * coef[k], 0)));
+  }
+  /* ---- elegir: la que deja los renglones más nítidos ---- */
+  // dyAt da "de dónde se toma" cada punto; para medir se mueve la tinta al revés (y - dy)
+  // Un cambio brusco entre columnas vecinas significaría "saltar" a otro renglón: esa corrección se descarta
+  const jumpy = fn => { for (let y = step / 2; y < Hd; y += step) { let prev = fn(0, y); for (let x = Wd / 24; x < Wd; x += Wd / 24) { const v = fn(x, y); if (Math.abs(v - prev) > L * 0.45) return true; prev = v; } } return false; };
+  const s0 = sRowSharpness(ink, Wd, Hd, null), cands = [];
+  for (const [name, fn] of [['A', fnA], ['B', fnB]]) if (fn && !jumpy(fn)) cands.push({ name, fn, s: sRowSharpness(ink, Wd, Hd, fn) });
+  if (!cands.length) return canvas;
+  const best = cands.reduce((a, b) => (b.s > a.s ? b : a));
+  if (best.s < s0 * 1.01) return canvas;
+  // aplicar a resolución completa con una grilla fina
+  const nb2 = 48, S2 = 32, Gs = [];
+  for (let j = 0; j < nb2; j++) { const row = []; for (let s = 0; s < S2; s++) row.push(best.fn((s / (S2 - 1)) * (Wd - 1), (j / (nb2 - 1)) * (Hd - 1))); Gs.push(row); }
+  // aplicar a resolución completa
+  const sctx = canvas.getContext('2d', { willReadFrequently: true }), sd = sctx.getImageData(0, 0, W, H).data;
+  const out = document.createElement('canvas'); out.width = W; out.height = H;
+  const octx = out.getContext('2d'), od = octx.createImageData(W, H), o = od.data;
+  const colA = new Float32Array(W), colI = new Int32Array(W);
+  for (let x = 0; x < W; x++) { const fs = Math.min(S2 - 1.001, (x / (W - 1)) * (S2 - 1)); colI[x] = Math.floor(fs); colA[x] = fs - colI[x]; }
+  for (let y = 0; y < H; y++) {
+    const fj = Math.min(nb2 - 1.001, (y / (H - 1)) * (nb2 - 1)), j0 = Math.floor(fj), bj = fj - j0, A0 = Gs[j0], A1 = Gs[j0 + 1];
+    for (let x = 0; x < W; x++) {
+      const s0 = colI[x], a = colA[x];
+      const dy = ((A0[s0] * (1 - a) + A0[s0 + 1] * a) * (1 - bj) + (A1[s0] * (1 - a) + A1[s0 + 1] * a) * bj) * f;
+      const yy = y + dy, y0 = Math.floor(yy), fy = yy - y0, oi = (y * W + x) * 4;
+      if (y0 < 0 || y0 >= H - 1) { o[oi] = o[oi + 1] = o[oi + 2] = 255; o[oi + 3] = 255; continue; }
+      const i0 = (y0 * W + x) * 4, i1 = i0 + W * 4;
+      o[oi] = sd[i0] * (1 - fy) + sd[i1] * fy; o[oi + 1] = sd[i0 + 1] * (1 - fy) + sd[i1 + 1] * fy; o[oi + 2] = sd[i0 + 2] * (1 - fy) + sd[i1 + 2] * fy; o[oi + 3] = 255;
+    }
+  }
+  octx.putImageData(od, 0, 0);
+  return out;
+}
+
+// Recorta el blanco sobrante alrededor del texto (queda un margen parejo)
+function scanTrim(canvas) {
+  const w = canvas.width, h = canvas.height, d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+  const rows = new Uint32Array(h), cols = new Uint32Array(w);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = (y * w + x) * 4; if (d[i] + d[i + 1] + d[i + 2] < 480) { rows[y]++; cols[x]++; } }
+  const minRow = Math.max(2, w * 0.004), minCol = Math.max(2, h * 0.002);
+  let y0 = 0, y1 = h - 1, x0 = 0, x1 = w - 1;
+  while (y0 < h && rows[y0] < minRow) y0++; while (y1 > y0 && rows[y1] < minRow) y1--;
+  while (x0 < w && cols[x0] < minCol) x0++; while (x1 > x0 && cols[x1] < minCol) x1--;
+  if (y1 - y0 < h * 0.2 || x1 - x0 < w * 0.2) return canvas; // casi vacío: no tocar
+  const m = Math.round(Math.max(x1 - x0, 200) * 0.06);
+  x0 = Math.max(0, x0 - m); y0 = Math.max(0, y0 - m); x1 = Math.min(w - 1, x1 + m); y1 = Math.min(h - 1, y1 + m);
+  const nw = x1 - x0 + 1, nh = y1 - y0 + 1;
+  if (nw * nh > w * h * 0.92) return canvas;
+  const out = document.createElement('canvas'); out.width = nw; out.height = nh;
+  out.getContext('2d').drawImage(canvas, x0, y0, nw, nh, 0, 0, nw, nh); return out;
+}
+function sSolve(A, b) { // Gauss con pivoteo; null si es singular
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++) { let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-12) return null; [M[c], M[p]] = [M[p], M[c]];
+    for (let r = 0; r < n; r++) { if (r === c) continue; const k = M[r][c] / M[c][c]; for (let j = c; j <= n; j++) M[r][j] -= k * M[c][j]; } }
+  return M.map((r, i) => r[n] / r[i]);
+}
+
+/* Limpieza tipo escáner.
+   - Dedos: piel pegada al borde → papel.
+   - Luz: se estima el brillo del papel sin texto (cierre morfológico a menor resolución + desenfoque) y se divide.
+     Eso aplana sombras y la parte ancha de los dobleces.
+   - Dobleces finos y manchas: lo que es solo "gris" (nunca tan oscuro como la tinta) y no está pegado a un trazo
+     de texto se vuelve blanco (umbral con histéresis).
+   mode 'clean' → blanco y negro; 'color' → color con la luz aplanada. */
+function scanClean(canvas, mode) {
+  const w = canvas.width, h = canvas.height, n = w * h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const id = ctx.getImageData(0, 0, w, h), d = id.data;
+  const g = new Float32Array(n), skin = new Uint8Array(n);
+  const wb = sWhiteGains(d, n); // con luz cálida el papel no debe confundirse con piel
+  for (let i = 0; i < n; i++) { const r = d[i * 4], gg = d[i * 4 + 1], b = d[i * 4 + 2]; g[i] = 0.299 * r + 0.587 * gg + 0.114 * b; skin[i] = sIsSkin(Math.min(255, r * wb[0]), Math.min(255, gg * wb[1]), Math.min(255, b * wb[2])) ? 1 : 0; }
+  const finger = new Uint8Array(n), stack = new Int32Array(n); let sp = 0;
+  const seedF = p => { if (skin[p] && !finger[p]) { finger[p] = 1; stack[sp++] = p; } };
+  for (let x = 0; x < w; x++) { seedF(x); seedF((h - 1) * w + x); } for (let y = 0; y < h; y++) { seedF(y * w); seedF(y * w + w - 1); }
+  while (sp) { const p = stack[--sp], x = p % w, y = (p / w) | 0;
+    if (x > 0) seedF(p - 1); if (x < w - 1) seedF(p + 1); if (y > 0) seedF(p - w); if (y < h - 1) seedF(p + w); }
+  const grow = Math.max(2, Math.round(w / 150));
+  const fGrown = sMorph(Float32Array.from(finger), w, h, grow, true);
+  // Fondo del papel a 1/4 de resolución
+  const q = Math.max(1, Math.round(Math.min(w, h) / 500)), wq = Math.ceil(w / q), hq = Math.ceil(h / q), gq = new Float32Array(wq * hq);
+  for (let y = 0; y < hq; y++) for (let x = 0; x < wq; x++) { let t = 0, c = 0; for (let yy = y * q; yy < Math.min(h, y * q + q); yy++) for (let xx = x * q; xx < Math.min(w, x * q + q); xx++) { const i = yy * w + xx; t += fGrown[i] ? 245 : g[i]; c++; } gq[y * wq + x] = t / c; }
+  const rT = Math.max(3, Math.round(wq * 0.022)); // más ancho que un trazo de letra
+  const closed = sMorph(sMorph(gq, wq, hq, rT, true), wq, hq, Math.round(rT * 0.6), false);
+  const bgq = sBoxBlur(closed, wq, hq, Math.max(2, Math.round(rT * 0.7)));
+  const bgAt = (x, y) => { const fx = Math.max(0, Math.min(wq - 1.001, x / q - 0.5)), fy = Math.max(0, Math.min(hq - 1.001, y / q - 0.5)), x0 = fx | 0, y0 = fy | 0, ax = fx - x0, ay = fy - y0;
+    return (bgq[y0 * wq + x0] * (1 - ax) + bgq[y0 * wq + x0 + 1] * ax) * (1 - ay) + (bgq[(y0 + 1) * wq + x0] * (1 - ax) + bgq[(y0 + 1) * wq + x0 + 1] * ax) * ay; };
+  const bg = new Float32Array(n), nv = new Float32Array(n);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x, b = Math.max(25, bgAt(x, y)); bg[i] = b; nv[i] = fGrown[i] ? 1 : Math.min(1.2, g[i] / b); }
+  // Umbrales: "tinta" según lo más oscuro de la factura; "gris" se conserva solo junto a la tinta
+  const hist = new Uint32Array(101); let cnt = 0; for (let i = 0; i < n; i += 3) { hist[Math.max(0, Math.min(100, Math.round(nv[i] * 100)))]++; cnt++; }
+  let acc = 0, p1 = 0.2; for (let b = 0; b <= 100; b++) { acc += hist[b]; if (acc >= cnt * 0.006) { p1 = b / 100; break; } }
+  const Ts = Math.max(0.3, Math.min(0.56, p1 + 0.36 * (1 - p1))), Tw = 0.86;
+  const strong = new Float32Array(n); for (let i = 0; i < n; i++) strong[i] = nv[i] < Ts ? 1 : 0;
+  // Trazos largos y finos que nunca fueron "tinta" ya quedaron fuera; ahora quitar dobleces tan oscuros como la tinta:
+  // componentes muy largas y delgadas (no hay letras de ese tamaño)
+  sCleanLongStrokes(strong, w, h);
+  const near = sMorph(strong, w, h, Math.max(1, Math.round(w / 420)), true);
+  const o = d;
+  if (mode === 'color') {
+    for (let i = 0; i < n; i++) {
+      const keep = near[i] && nv[i] < Tw, k = fGrown[i] ? 0 : keep ? 1 : 0;
+      const b = bg[i] / 255;
+      for (let c = 0; c < 3; c++) { const v = Math.min(255, d[i * 4 + c] * wb[c] / Math.max(0.1, b)); o[i * 4 + c] = k ? Math.min(255, v * 0.96) : 255; }
+      if (k) { const t = Math.max(0, Math.min(1, (nv[i] - Ts * 0.6) / (Tw - Ts * 0.6))); for (let c = 0; c < 3; c++) o[i * 4 + c] = o[i * 4 + c] * (1 - t) + 255 * t; }
+      o[i * 4 + 3] = 255;
+    }
+  } else {
+    const LO = Math.max(0.12, Ts - 0.22);
+    for (let i = 0; i < n; i++) {
+      let v = 1;
+      if (!fGrown[i] && near[i] && nv[i] < Tw) { v = (nv[i] - LO) / (Tw - LO); v = Math.max(0, Math.min(1, v)); v = Math.pow(v, 1.5); }
+      const c = Math.round(v * 255); o[i * 4] = o[i * 4 + 1] = o[i * 4 + 2] = c; o[i * 4 + 3] = 255;
+    }
+  }
+  // Restos del fondo pegados al borde (franja del 4 %)
+  const band = Math.max(4, Math.round(Math.min(w, h) * 0.04)), band2 = Math.max(2, Math.round(Math.min(w, h) * 0.015)), seen = new Uint8Array(n), st = [];
+  const inBand = (x, y) => x < band || y < band || x >= w - band || y >= h - band;
+  const inBand2 = (x, y) => x < band2 || y < band2 || x >= w - band2 || y >= h - band2;
+  const lum = i => 0.299 * o[i * 4] + 0.587 * o[i * 4 + 1] + 0.114 * o[i * 4 + 2];
+  for (let x = 0; x < w; x++) { st.push(x, (h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { st.push(y * w, y * w + w - 1); }
+  while (st.length) {
+    const i = st.pop(); if (seen[i]) continue; seen[i] = 1;
+    const x = i % w, y = (i / w) | 0;
+    if (lum(i) > 170) { // papel blanco: se sigue buscando solo muy cerca del borde
+      if (inBand2(x, y)) { if (x > 0) st.push(i - 1); if (x < w - 1) st.push(i + 1); if (y > 0) st.push(i - w); if (y < h - 1) st.push(i + w); }
+      continue;
+    }
+    if (!inBand(x, y)) continue;
+    o[i * 4] = o[i * 4 + 1] = o[i * 4 + 2] = 255;
+    if (x > 0) st.push(i - 1); if (x < w - 1) st.push(i + 1); if (y > 0) st.push(i - w); if (y < h - 1) st.push(i + w);
+  }
+  const out = document.createElement('canvas'); out.width = w; out.height = h;
+  out.getContext('2d').putImageData(id, 0, 0);
+  return { canvas: out, fingers: C.sum(Array.from(finger)) };
+}
+// Quita de la máscara de tinta las componentes que son líneas largas y finas (dobleces marcados)
+function sCleanLongStrokes(mask, w, h) {
+  const n = w * h, lab = new Int32Array(n), stack = new Int32Array(n); let id = 0;
+  const stroke = Math.max(2, w / 220); // grosor típico de un trazo
+  for (let s = 0; s < n; s++) {
+    if (!mask[s] || lab[s]) continue;
+    id++; let sp = 0; stack[sp++] = s; lab[s] = id; const px = [];
+    let x0 = w, x1 = 0, y0 = h, y1 = 0;
+    while (sp) { const p = stack[--sp]; px.push(p); const x = p % w, y = (p / w) | 0;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (const q of [p - 1, p + 1, p - w, p + w, p - w - 1, p - w + 1, p + w - 1, p + w + 1]) { if (q < 0 || q >= n || !mask[q] || lab[q]) continue; const qx = q % w; if (Math.abs(qx - x) > 1) continue; lab[q] = id; stack[sp++] = q; } }
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    // una componente más larga que 1/3 del ancho y muy delgada en promedio no es texto
+    if (len > w * 0.33 && px.length / len < stroke * 2.2) for (const p of px) mask[p] = 0;
+  }
+}
+
+function scanRotate(canvas, quad, curve) {
+  const w = canvas.width, h = canvas.height, out = document.createElement('canvas'); out.width = h; out.height = w;
+  const c = out.getContext('2d'); c.translate(h, 0); c.rotate(Math.PI / 2); c.drawImage(canvas, 0, 0);
+  const q = quad ? quad.map(([x, y]) => [h - y, x]) : null;
+  return { canvas: out, quad: q ? [q[3], q[0], q[1], q[2]] : null, curve: curve ? curveRotate(curve) : null };
+}
+function canvasToBlob(cv, type, q) { return new Promise(res => cv.toBlob(res, type, q)); }
+function scaleCanvas(src, maxSide) {
+  const k = Math.min(1, maxSide / Math.max(src.width, src.height)); if (k === 1) return src;
+  const c = document.createElement('canvas'); c.width = Math.round(src.width * k); c.height = Math.round(src.height * k);
+  c.getContext('2d').drawImage(src, 0, 0, c.width, c.height); return c;
+}
+async function imageFileToCanvas(file, maxSide) {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+    const k = Math.min(1, (maxSide || 3000) / Math.max(img.naturalWidth, img.naturalHeight));
+    const c = document.createElement('canvas'); c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); return c;
+  } finally { URL.revokeObjectURL(url); }
+}
+
+/* ================= PDF (una página con la imagen y el texto leído invisible para poder buscarlo) ================= */
+function pdfStr(s) { // WinAnsi básico: latin-1 directo, lo demás como "?"
+  let o = ''; for (const ch of String(s)) { const c = ch.charCodeAt(0); const cc = c < 256 ? ch : '?'; o += cc === '(' || cc === ')' || cc === '\\' ? '\\' + cc : cc; } return o;
+}
+async function buildReceiptPdf(jpegBlob, pxW, pxH, words) {
+  const jpg = new Uint8Array(await jpegBlob.arrayBuffer());
+  const W = 226.77, H = +(W * pxH / pxW).toFixed(2); // ancho de tirilla de 80 mm
+  const sx = W / pxW, sy = H / pxH;
+  let text = '';
+  for (const wd of words || []) {
+    const t = String(wd.text || '').trim(); if (!t || !wd.bbox) continue;
+    const { x0, y0, x1, y1 } = wd.bbox, fs = Math.max(2, (y1 - y0) * sy * 0.92), wpt = (x1 - x0) * sx;
+    const tz = Math.max(20, Math.min(300, 100 * wpt / Math.max(1, 0.5 * fs * t.length)));
+    text += `BT /F1 ${fs.toFixed(2)} Tf 3 Tr ${tz.toFixed(1)} Tz ${(x0 * sx).toFixed(2)} ${(H - y1 * sy + (y1 - y0) * sy * 0.2).toFixed(2)} Td (${pdfStr(t)}) Tj ET\n`;
+  }
+  const content = `q ${W} 0 0 ${H} 0 0 cm /Im0 Do Q\n${text}`;
+  const enc = s => { const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 255; return a; };
+  const parts = [], offsets = []; let len = 0;
+  const push = p => { const u = typeof p === 'string' ? enc(p) : p; parts.push(u); len += u.length; };
+  push('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
+  const obj = (n, body) => { offsets[n] = len; push(`${n} 0 obj\n`); for (const b of [].concat(body)) push(b); push('\nendobj\n'); };
+  obj(1, '<< /Type /Catalog /Pages 2 0 R >>');
+  obj(2, '<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+  obj(3, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${W} ${H}] /Resources << /XObject << /Im0 4 0 R >> /Font << /F1 6 0 R >> >> /Contents 5 0 R >>`);
+  obj(4, [`<< /Type /XObject /Subtype /Image /Width ${pxW} /Height ${pxH} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpg.length} >>\nstream\n`, jpg, '\nendstream']);
+  const cb = enc(content);
+  obj(5, [`<< /Length ${cb.length} >>\nstream\n`, cb, '\nendstream']);
+  obj(6, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>');
+  const xref = len;
+  let x = 'xref\n0 7\n0000000000 65535 f \n'; for (let i = 1; i <= 6; i++) x += String(offsets[i]).padStart(10, '0') + ' 00000 n \n';
+  push(x); push(`trailer\n<< /Size 7 /Root 1 0 R /Info << /Producer (WalletWeb) /Title (Factura) >> >>\nstartxref\n${xref}\n%%EOF\n`);
+  return new Blob(parts, { type: 'application/pdf' });
+}
+function ocrWords(data) {
+  if (Array.isArray(data.words) && data.words.length) return data.words;
+  const out = [];
+  for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) for (const w of l.words || []) out.push(w);
+  return out;
+}
+
+/* ================= Interfaz del escáner ================= */
+const SC = { el: null, stream: null, timer: null, last: null, stable: 0, auto: true, onDone: null, src: null, quad: null, curve: null, mode: 'clean', drag: -1 };
+function openScanner(onDone, preset) {
+  closeScanner();
+  SC.onDone = onDone; SC.auto = S.settings.scanAuto !== false; SC.mode = S.settings.scanMode || 'clean';
+  const el = document.createElement('div'); el.className = 'scanner'; el.setAttribute('role', 'dialog'); el.setAttribute('aria-modal', 'true'); el.setAttribute('aria-label', 'Escanear factura');
+  document.body.appendChild(el); SC.el = el; document.body.style.overflow = 'hidden';
+  if (preset) { scanEditor(preset.canvas, preset.quad, preset.curve, preset.userCurve); return; }
+  el.innerHTML = `<div class="sc-top"><button class="sc-btn" data-sc="close" aria-label="Cerrar">${ic('x')}</button><div class="sc-title">Escanear factura</div><button class="sc-btn sc-auto" data-sc="auto" aria-pressed="${SC.auto}">Auto</button></div>
+    <div class="sc-stage"><video playsinline muted autoplay></video><canvas class="sc-ov"></canvas><div class="sc-msg" role="status">Abriendo la cámara…</div></div>
+    <div class="sc-hint">Pon la tirilla estirada sobre una superficie oscura. ${SC.auto ? 'Se toma sola cuando la detecta quieta.' : 'Toca el botón para tomarla.'}</div>
+    <div class="sc-bar"><label class="sc-side">${ic('upload')}<span>Galería</span><input type="file" accept="image/*" class="sr-only" data-sc-file></label>
+      <button class="sc-shutter" data-sc="shot" aria-label="Tomar foto"><span></span></button><span class="sc-side"></span></div>`;
+  startCamera();
+}
+async function startCamera() {
+  const v = $('video', SC.el), msg = $('.sc-msg', SC.el);
+  if (!navigator.mediaDevices?.getUserMedia) { msg.innerHTML = 'Este navegador no permite usar la cámara aquí.<br>Usa <b>Galería</b>.'; return; }
+  try {
+    SC.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1440 } }, audio: false });
+    if (!SC.el) { stopCamera(); return; }
+    v.srcObject = SC.stream; await v.play().catch(() => {});
+    msg.textContent = 'Buscando la factura…';
+    SC.timer = setInterval(scanTick, 200);
+  } catch (e) {
+    msg.innerHTML = (IN_FRAME ? 'La vista previa de Claude no permite la cámara.' : e.name === 'NotAllowedError' ? 'Permiso de cámara denegado. Actívalo en Ajustes del iPhone → Safari → Cámara.' : 'No se pudo abrir la cámara.') + '<br>Usa <b>Galería</b>.';
+  }
+}
+function stopCamera() { clearInterval(SC.timer); SC.timer = null; if (SC.stream) SC.stream.getTracks().forEach(t => t.stop()); SC.stream = null; }
+function closeScanner() { stopCamera(); if (SC.el) { SC.el.remove(); SC.el = null; } if (!sheets.length) document.body.style.overflow = ''; }
+// Dibuja sobre el video el contorno detectado y dispara la captura automática cuando está quieto
+function scanTick() {
+  const v = $('video', SC.el), ov = $('.sc-ov', SC.el), msg = $('.sc-msg', SC.el);
+  if (!v || v.readyState < 2 || !v.videoWidth) return;
+  const vw = v.videoWidth, vh = v.videoHeight, r = v.getBoundingClientRect();
+  ov.width = r.width * devicePixelRatio; ov.height = r.height * devicePixelRatio;
+  const k = Math.min(r.width / vw, r.height / vh), ox = (r.width - vw * k) / 2, oy = (r.height - vh * k) / 2;
+  const det = scanDetect(v, vw, vh);
+  const c = ov.getContext('2d'); c.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); c.clearRect(0, 0, r.width, r.height);
+  const good = det && det.score > 0.82 && det.cover > 0.12;
+  if (det && det.score > 0.6) {
+    c.beginPath(); det.quad.forEach(([x, y], i) => c[i ? 'lineTo' : 'moveTo'](ox + x * k, oy + y * k)); c.closePath();
+    c.fillStyle = good ? 'rgba(255,255,255,.18)' : 'rgba(255,255,255,.08)'; c.fill();
+    c.setLineDash(good ? [] : [8, 6]);
+    c.lineWidth = 7; c.strokeStyle = 'rgba(0,0,0,.45)'; c.stroke();
+    c.lineWidth = 3; c.strokeStyle = good ? '#fff' : 'rgba(255,255,255,.7)'; c.stroke();
+    c.setLineDash([]);
+    det.quad.forEach(([x, y]) => { c.beginPath(); c.arc(ox + x * k, oy + y * k, 7, 0, Math.PI * 2); c.fillStyle = '#fff'; c.fill(); c.lineWidth = 2; c.strokeStyle = 'rgba(0,0,0,.5)'; c.stroke(); });
+  }
+  if (good && SC.last) {
+    const mv = Math.max(...det.quad.map((p, i) => Math.hypot(p[0] - SC.last[i][0], p[1] - SC.last[i][1]))) / Math.hypot(vw, vh);
+    SC.stable = mv < 0.02 ? SC.stable + 1 : 0;
+  } else SC.stable = 0;
+  SC.last = good ? det.quad : null;
+  const need = 7; // ~1,4 s quieto
+  msg.textContent = !det || det.score <= 0.6 ? 'Buscando la factura…' : !good ? 'Acércate un poco y pon la tirilla sobre un fondo oscuro' : SC.auto ? (SC.stable >= 2 ? 'Quieto… tomando la foto' : 'Factura detectada · mantén quieto') : 'Factura detectada · toca el botón';
+  const sh = $('.sc-shutter', SC.el); if (sh) sh.style.setProperty('--p', SC.auto ? Math.min(1, SC.stable / need) : 0);
+  if (SC.auto && good && SC.stable >= need) scanShot(det.quad);
+}
+function scanShot(quad) {
+  const v = $('video', SC.el); if (!v || !v.videoWidth) { toast('La cámara aún no está lista.'); return; }
+  const cv = document.createElement('canvas'); cv.width = v.videoWidth; cv.height = v.videoHeight;
+  cv.getContext('2d').drawImage(v, 0, 0);
+  stopCamera();
+  if (navigator.vibrate) navigator.vibrate(30);
+  scanEditor(cv, quad || null);
+}
+// Pantalla para ajustar el recorte: esquinas (círculos grandes) y curvatura de cada borde (círculos pequeños del medio)
+function scanEditor(canvas, quad, curve, userCurve) {
+  SC.src = canvas;
+  if (!curve) { // detección fina sobre la foto tomada: esquinas más precisas y bordes curvos
+    const det = scanDetect(canvas, canvas.width, canvas.height, 900);
+    if (det && det.score > 0.6) { const rf = scanRefine(det); quad = rf.quad; curve = rf.curve; }
+  }
+  SC.quad = (quad || scanFullQuad(canvas.width, canvas.height)).map(p => p.slice());
+  SC.curve = curve ? JSON.parse(JSON.stringify(curve)) : curveZero(); SC.userCurve = !!userCurve;
+  SC.el.innerHTML = `<div class="sc-top"><button class="sc-btn" data-sc="retake" aria-label="Repetir">${ic('left')}</button><div class="sc-title">Ajusta el recorte</div><button class="sc-btn" data-sc="rotate" aria-label="Rotar">${ic('repeat')}</button></div>
+    <div class="sc-stage"><canvas class="sc-edit" aria-label="Foto con el recorte. Arrastra las esquinas para ajustarlo."></canvas></div>
+    <div class="sc-hint">Círculos grandes: esquinas. Puntos pequeños: arrástralos para seguir la forma del papel.</div>
+    <div class="sc-bar2"><div class="seg sc-seg" role="group" aria-label="Acabado">${[['clean', 'Mejorada'], ['color', 'Color']].map(([v, l]) => `<button type="button" data-sc="mode" data-v="${v}" aria-pressed="${SC.mode === v}">${l}</button>`).join('')}</div>
+      <button class="btn primary sc-done" data-sc="done">${ic('check', 'sm')} Usar</button></div>`;
+  const ec = $('.sc-edit', SC.el);
+  const pos = e => { const r = ec.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  ec.addEventListener('pointerdown', e => {
+    const [px, py] = pos(e), t = SC.view; if (!t) return;
+    let best = -1, bd = 34;
+    scanHandles().forEach((hd, i) => { const dd = Math.hypot(t.ox + hd.x * t.k - px, t.oy + hd.y * t.k - py) - (i < 4 ? 6 : 0); if (dd < bd) { bd = dd; best = i; } });
+    if (best >= 0) { SC.drag = best; SC.dragH = scanHandles()[best]; if (best >= 4) SC.userCurve = true; SC.base = JSON.parse(JSON.stringify(SC.curve)); ec.setPointerCapture(e.pointerId); e.preventDefault(); }
+  });
+  ec.addEventListener('pointermove', e => {
+    if (SC.drag < 0) return; const [px, py] = pos(e), t = SC.view;
+    const sx = Math.max(0, Math.min(SC.src.width, (px - t.ox) / t.k)), sy = Math.max(0, Math.min(SC.src.height, (py - t.oy) / t.k));
+    if (SC.drag < 4) SC.quad[SC.drag] = [sx, sy];
+    else {
+      // punto de borde: deforma solo su tramo (campana que llega a cero en los puntos vecinos)
+      const hd = SC.dragH, key = hd.key, s0 = hd.s, half = hd.half;
+      const [u, v] = sApplyH(sHomography(SC.quad, UNIT), sx, sy);
+      const want = key === 't' ? v : key === 'b' ? v - 1 : key === 'l' ? u : u - 1;
+      const delta = want - curveSample(SC.base[key], s0);
+      SC.curve[key] = SC.base[key].map((o, i) => { const d = Math.abs(i / (CURVE_N - 1) - s0) / half, kk = d < 1 ? Math.pow(Math.cos(Math.PI / 2 * d), 2) : 0; return Math.max(-0.3, Math.min(0.3, o + delta * kk)); });
+    }
+    drawEditor(); e.preventDefault();
+  });
+  const up = () => { SC.drag = -1; drawEditor(); };
+  ec.addEventListener('pointerup', up); ec.addEventListener('pointercancel', up);
+  requestAnimationFrame(drawEditor);
+}
+// Puntos de control: 0–3 esquinas; después varios puntos por borde (más en los bordes largos) para dar formas irregulares
+function scanHandles() {
+  const H = sHomography(UNIT, SC.quad), k = SC.view ? SC.view.k : 1, out = SC.quad.map(([x, y]) => ({ x, y, corner: true }));
+  const len = (a, b) => Math.hypot(SC.quad[a][0] - SC.quad[b][0], SC.quad[a][1] - SC.quad[b][1]) * k;
+  const edges = [['t', len(0, 1)], ['r', len(1, 2)], ['b', len(3, 2)], ['l', len(0, 3)]];
+  for (const [key, L] of edges) {
+    const nh = Math.max(1, Math.min(3, Math.floor(L / 95))), half = 1 / (nh + 1);
+    for (let j = 1; j <= nh; j++) {
+      const s = j * half, uv = key === 't' ? [s, 0] : key === 'b' ? [s, 1] : key === 'l' ? [0, s] : [1, s];
+      const [px, py] = coons(SC.curve, uv[0], uv[1]), [x, y] = sApplyH(H, px, py);
+      out.push({ x, y, key, s, half });
+    }
+  }
+  return out;
+}
+function drawEditor() {
+  const ec = SC.el && $('.sc-edit', SC.el); if (!ec) return;
+  const r = ec.getBoundingClientRect(); ec.width = r.width * devicePixelRatio; ec.height = r.height * devicePixelRatio;
+  const c = ec.getContext('2d'); c.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); c.clearRect(0, 0, r.width, r.height);
+  const k = Math.min(r.width / SC.src.width, r.height / SC.src.height), ox = (r.width - SC.src.width * k) / 2, oy = (r.height - SC.src.height * k) / 2;
+  SC.view = { k, ox, oy };
+  c.drawImage(SC.src, ox, oy, SC.src.width * k, SC.src.height * k);
+  const P = curveOutline(SC.quad, SC.curve, 24).map(([x, y]) => [ox + x * k, oy + y * k]);
+  c.save(); c.fillStyle = 'rgba(0,0,0,.45)'; c.beginPath(); c.rect(0, 0, r.width, r.height); P.forEach(([x, y], i) => c[i ? 'lineTo' : 'moveTo'](x, y)); c.closePath(); c.fill('evenodd'); c.restore();
+  c.beginPath(); P.forEach(([x, y], i) => c[i ? 'lineTo' : 'moveTo'](x, y)); c.closePath();
+  c.lineWidth = 5; c.strokeStyle = 'rgba(0,0,0,.35)'; c.stroke(); c.lineWidth = 2.5; c.strokeStyle = '#fff'; c.stroke();
+  scanHandles().forEach((hd, i) => {
+    const X = ox + hd.x * k, Y = oy + hd.y * k, big = i < 4, rad = (big ? 12 : 7) + (SC.drag === i ? 4 : 0);
+    c.beginPath(); c.arc(X, Y, rad, 0, Math.PI * 2); c.fillStyle = big ? 'rgba(255,255,255,.35)' : '#fff'; c.fill();
+    c.lineWidth = big ? 3 : 2; c.strokeStyle = big ? '#fff' : 'rgba(0,0,0,.45)'; c.stroke();
+  });
+}
+async function scanFinish() {
+  const btn = $('.sc-done', SC.el); if (btn) { btn.disabled = true; btn.innerHTML = 'Procesando…'; }
+  await new Promise(r => setTimeout(r, 30));
+  try {
+    let warped = scanWarp(SC.src, SC.quad, 2200, SC.curve);
+    // Si la curva vino de la detección (no la tocaste), se verifica que de verdad mejore: con bordes mal medidos
+    // la curva podría torcer el texto en "S". Se queda la versión con renglones más nítidos.
+    if (!SC.userCurve && ['t', 'r', 'b', 'l'].some(k => SC.curve[k].some(v => Math.abs(v) > 0.004))) {
+      const flat = scanWarp(SC.src, SC.quad, 2200, curveZero());
+      const sh = cv => { const s = sInkSmall(cv, 300); return sRowSharpness(s.ink, s.Wd, s.Hd, null); };
+      if (sh(flat) > sh(warped) * 1.02) warped = flat;
+    }
+    const level = scanDeskew(warped).canvas;                  // gira el texto si viene inclinado
+    let straight = level; for (let i = 0; i < 4; i++) { const nx = scanStraighten(straight); if (nx === straight) break; straight = nx; } // endereza renglones (hasta 4 pasadas, solo si mejora)
+    const res = scanClean(straight, SC.mode); res.canvas = scanTrim(res.canvas);
+    const done = SC.onDone, src = SC.src, quad = SC.quad.map(p => p.slice()), curve = JSON.parse(JSON.stringify(SC.curve)), mode = SC.mode, userCurve = SC.userCurve;
+    closeScanner();
+    if (done) await done({ canvas: res.canvas, src, quad, curve, userCurve, mode, fingers: res.fingers });
+  } catch (e) { toast('No se pudo procesar la foto. Intenta de nuevo.'); if (btn) { btn.disabled = false; btn.innerHTML = 'Usar'; } }
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-sc]'); if (!b || !SC.el || !SC.el.contains(b)) return;
+  const a = b.dataset.sc;
+  if (a === 'close') closeScanner();
+  if (a === 'auto') { SC.auto = !SC.auto; S.settings.scanAuto = SC.auto; save(); b.setAttribute('aria-pressed', String(SC.auto)); SC.stable = 0; const h = $('.sc-hint', SC.el); if (h) h.textContent = 'Pon la tirilla estirada sobre una superficie oscura. ' + (SC.auto ? 'Se toma sola cuando la detecta quieta.' : 'Toca el botón para tomarla.'); }
+  if (a === 'shot') scanShot(SC.last);
+  if (a === 'retake') { const cb = SC.onDone; openScanner(cb); }
+  if (a === 'rotate') { const r = scanRotate(SC.src, SC.quad, SC.curve); SC.src = r.canvas; SC.quad = r.quad; SC.curve = r.curve; drawEditor(); }
+  if (a === 'mode') { SC.mode = b.dataset.v; S.settings.scanMode = SC.mode; save(); $$('[data-sc="mode"]', SC.el).forEach(x => x.setAttribute('aria-pressed', String(x.dataset.v === SC.mode))); }
+  if (a === 'done') scanFinish();
+});
+document.addEventListener('change', async e => {
+  if (!e.target.matches('[data-sc-file]') || !SC.el) return;
+  const f = e.target.files && e.target.files[0]; e.target.value = ''; if (!f) return;
+  try { const cv = await imageFileToCanvas(f, 3000); stopCamera(); scanEditor(cv, null); }
+  catch (er) { toast('No se pudo abrir la imagen.'); }
+});
+window.addEventListener('resize', () => { if (SC.el && $('.sc-edit', SC.el)) drawEditor(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) closeScanner(); });
+
+
+/* ---------- Visor de la factura (pantalla completa, con zoom) ---------- */
+// Saca la foto (JPEG) que va dentro de un PDF. Sirve para los PDF del escáner y para muchos PDF escaneados de otras apps.
+async function pdfExtractJpeg(blob) {
+  try {
+    const u = new Uint8Array(await blob.arrayBuffer());
+    let s = ''; const CH = 0x8000;
+    for (let i = 0; i < u.length; i += CH) s += String.fromCharCode.apply(null, u.subarray(i, i + CH));
+    let best = null, at = 0;
+    while ((at = s.indexOf('/DCTDecode', at)) >= 0) {
+      const d0 = s.lastIndexOf('<<', at), d1 = s.indexOf('stream', at);
+      if (d0 < 0 || d1 < 0) break;
+      const dict = s.slice(d0, d1);
+      let p = d1 + 6; if (s[p] === '\r') p++; if (s[p] === '\n') p++;
+      const m = /\/Length\s+(\d+)(\s+\d+\s+R)?/.exec(dict);
+      let len = m && !m[2] ? +m[1] : -1;
+      if (len < 0 || u[p] !== 0xFF || u[p + 1] !== 0xD8) { const e = s.indexOf('endstream', p); len = e > p ? s.lastIndexOf('\xFF\xD9', e) + 2 - p : -1; }
+      const W = +(/\/Width\s+(\d+)/.exec(dict) || [])[1] || 0, H = +(/\/Height\s+(\d+)/.exec(dict) || [])[1] || 0;
+      if (len > 0 && u[p] === 0xFF && u[p + 1] === 0xD8 && (!best || W * H > best.W * best.H)) best = { p, len, W, H };
+      at = d1;
+    }
+    return best ? new Blob([u.subarray(best.p, best.p + best.len)], { type: 'image/jpeg' }) : null;
+  } catch { return null; }
+}
+const VW = { el: null, urls: [], s: 1, x: 0, y: 0, pts: new Map(), pinch: null, lastTap: 0 };
+// opts: { image: Blob|null, pdf: Blob|null, name, sub, canAdjust }
+function openViewer(opts) {
+  closeViewer();
+  const el = document.createElement('div'); el.className = 'viewer'; el.setAttribute('role', 'dialog'); el.setAttribute('aria-modal', 'true'); el.setAttribute('aria-label', 'Factura');
+  const url = b => { const u = URL.createObjectURL(b); VW.urls.push(u); return u; };
+  const canShare = !!(opts.pdf && navigator.canShare && navigator.canShare({ files: [new File([opts.pdf], opts.name || 'Factura.pdf', { type: 'application/pdf' })] }));
+  el.innerHTML = `<div class="sc-top"><button class="sc-btn" data-vw="close" aria-label="Cerrar">${ic('x')}</button>
+      <div class="vw-title"><div class="sc-title">${esc(opts.name || 'Factura')}</div>${opts.sub ? `<div class="vw-sub">${esc(opts.sub)}</div>` : ''}</div>
+      <button class="sc-btn" data-vw="zoom" aria-label="Acercar">${ic('zoom')}</button></div>
+    <div class="vw-stage">${opts.image ? `<img class="vw-img" alt="Factura escaneada" draggable="false" src="${url(opts.image)}">` : `<div class="vw-empty">${ic('doc')}<p>Este PDF no trae una imagen que se pueda mostrar aquí.</p></div>`}</div>
+    <div class="sc-hint">${opts.image ? 'Pellizca o toca dos veces para acercar.' : ''}</div>
+    <div class="sc-bar2">${opts.canAdjust ? `<button class="sc-btn" data-vw="adjust" style="flex:1">${ic('edit', 'sm')} Ajustar</button>` : ''}
+      ${opts.pdf ? `<a class="sc-btn" style="flex:1;text-decoration:none" href="${url(opts.pdf)}" target="_blank" rel="noopener">${ic('doc', 'sm')} Abrir PDF</a>` : ''}
+      ${canShare ? `<button class="sc-btn sc-done" data-vw="share" style="flex:1">${ic('share', 'sm')} Compartir</button>` : opts.pdf ? `<a class="sc-btn sc-done" style="flex:1;text-decoration:none" href="${url(opts.pdf)}" download="${esc(opts.name || 'Factura.pdf')}">${ic('download', 'sm')} Guardar</a>` : ''}</div>`;
+  document.body.appendChild(el); VW.el = el; VW.opts = opts; document.body.style.overflow = 'hidden';
+  VW.s = 1; VW.x = 0; VW.y = 0; VW.pts.clear(); VW.pinch = null;
+  const img = $('.vw-img', el); if (img) img.onload = () => vwApply();
+}
+function closeViewer() {
+  if (!VW.el) return;
+  VW.el.remove(); VW.el = null; VW.urls.forEach(u => URL.revokeObjectURL(u)); VW.urls = [];
+  if (!SC.el) document.body.style.overflow = '';
+}
+function vwApply(anim) {
+  const img = VW.el && $('.vw-img', VW.el); if (!img) return;
+  const st = $('.vw-stage', VW.el).getBoundingClientRect(), w = img.offsetWidth * VW.s, h = img.offsetHeight * VW.s;
+  const mx = Math.max(0, (w - st.width) / 2), my = Math.max(0, (h - st.height) / 2);
+  VW.x = Math.max(-mx, Math.min(mx, VW.x)); VW.y = Math.max(-my, Math.min(my, VW.y));
+  img.style.transition = anim ? 'transform .22s ease' : 'none';
+  img.style.transform = `translate(${VW.x}px, ${VW.y}px) scale(${VW.s})`;
+}
+// Acercar dejando quieto el punto (cx, cy) de la pantalla
+function vwZoomAt(ns, cx, cy, anim) {
+  const st = $('.vw-stage', VW.el).getBoundingClientRect();
+  ns = Math.max(1, Math.min(6, ns));
+  const ox = cx - (st.left + st.width / 2), oy = cy - (st.top + st.height / 2), k = ns / VW.s;
+  VW.x = ox - (ox - VW.x) * k; VW.y = oy - (oy - VW.y) * k; VW.s = ns;
+  if (ns === 1) { VW.x = 0; VW.y = 0; }
+  vwApply(anim);
+}
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-vw]'); if (!b || !VW.el) return;
+  const a = b.dataset.vw;
+  if (a === 'close') closeViewer();
+  else if (a === 'zoom') { const st = $('.vw-stage', VW.el).getBoundingClientRect(); vwZoomAt(VW.s > 1.05 ? 1 : 2.5, st.left + st.width / 2, st.top + st.height / 3, true); }
+  else if (a === 'adjust') { closeViewer(); if (D?._scan) openScanner(useScan, { canvas: D._scan.src, quad: D._scan.quad, curve: D._scan.curve, userCurve: D._scan.userCurve }); }
+  else if (a === 'share') {
+    const o = VW.opts; try { await navigator.share({ files: [new File([o.pdf], o.name || 'Factura.pdf', { type: 'application/pdf' })], title: o.name || 'Factura' }); } catch (err) { if (err?.name !== 'AbortError') toast('No se pudo compartir.'); }
+  }
+});
+document.addEventListener('pointerdown', e => {
+  if (!VW.el || !e.target.closest('.vw-stage') || !$('.vw-img', VW.el)) return;
+  e.preventDefault();
+  VW.pts.set(e.pointerId, [e.clientX, e.clientY]);
+  if (VW.pts.size === 2) { const [p, q] = [...VW.pts.values()]; VW.pinch = { d: Math.hypot(p[0] - q[0], p[1] - q[1]), s: VW.s, cx: (p[0] + q[0]) / 2, cy: (p[1] + q[1]) / 2 }; }
+  if (VW.pts.size === 1) {
+    const now = Date.now();
+    if (now - VW.lastTap < 300) { vwZoomAt(VW.s > 1.05 ? 1 : 2.5, e.clientX, e.clientY, true); VW.lastTap = 0; } else VW.lastTap = now;
+  }
+}, { passive: false });
+document.addEventListener('pointermove', e => {
+  if (!VW.el || !VW.pts.has(e.pointerId)) return;
+  const prev = VW.pts.get(e.pointerId); VW.pts.set(e.pointerId, [e.clientX, e.clientY]);
+  if (VW.pts.size >= 2 && VW.pinch) {
+    const [p, q] = [...VW.pts.values()], d = Math.hypot(p[0] - q[0], p[1] - q[1]);
+    const cx = (p[0] + q[0]) / 2, cy = (p[1] + q[1]) / 2;
+    VW.x += cx - VW.pinch.cx; VW.y += cy - VW.pinch.cy; VW.pinch.cx = cx; VW.pinch.cy = cy;
+    vwZoomAt(VW.pinch.s * d / VW.pinch.d, cx, cy);
+  } else if (VW.s > 1) { VW.x += e.clientX - prev[0]; VW.y += e.clientY - prev[1]; vwApply(); }
+});
+const vwUp = e => { if (!VW.el) return; VW.pts.delete(e.pointerId); if (VW.pts.size < 2) VW.pinch = null; if (VW.s < 1.05 && VW.s !== 1) vwZoomAt(1, 0, 0, true); };
+document.addEventListener('pointerup', vwUp); document.addEventListener('pointercancel', vwUp);
+document.addEventListener('wheel', e => { if (!VW.el || !e.target.closest('.vw-stage')) return; e.preventDefault(); vwZoomAt(VW.s * Math.exp(-e.deltaY / 300), e.clientX, e.clientY); }, { passive: false });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && VW.el) closeViewer(); });
+window.addEventListener('resize', () => { if (VW.el) vwApply(); });
