@@ -1,0 +1,110 @@
+<!doctype html><meta charset="utf-8"><body>
+<script src="../../core.js"></script>
+<script>
+const C = WWCore; const $ = (s, e = document) => e.querySelector(s), $$ = (s, e = document) => [...e.querySelectorAll(s)];
+const S = { settings: {} }; const IN_FRAME = false; const ic = () => ''; const toast = () => {}; const sheets = [];
+</script>
+<script src="../../app-scan.js"></script>
+<script>
+function loadImg(url, maxSide = 4200) {
+  return new Promise((res, rej) => { const i = new Image(); i.onload = () => { const k = Math.min(1, maxSide / Math.max(i.naturalWidth, i.naturalHeight)); const c = document.createElement('canvas'); c.width = Math.round(i.naturalWidth * k); c.height = Math.round(i.naturalHeight * k); c.getContext('2d').drawImage(i, 0, 0, c.width, c.height); res(c); }; i.onerror = rej; i.src = url; });
+}
+let worker = null;
+async function getWorker() {
+  if (worker) return worker;
+  await new Promise((res, rej) => { const s = document.createElement('script'); s.src = '../../vendor/tesseract/tesseract.min.js'; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
+  const base = new URL('../../vendor/tesseract/', location.href).href;
+  worker = await Tesseract.createWorker('spa', 1, { workerPath: base + 'worker.min.js', corePath: base, langPath: base + 'lang', workerBlobURL: false, gzip: true });
+  await worker.setParameters({ tessedit_pageseg_mode: '6', preserve_interword_spaces: '1' });
+  return worker;
+}
+// Mismo camino que la app: detectar → procesar → leer → interpretar
+window.runScan = async (url, opts = {}) => {
+  const cv = await loadImg(url);
+  const t0 = performance.now();
+  const a = scanAutoDetect(cv);
+  const t1 = performance.now();
+  const res = scanProcess(cv, a.quad, a.curve, false, opts.mode || 'clean', opts.noMask ? null : a.det);
+  const t2 = performance.now();
+  const out = { srcW: cv.width, srcH: cv.height, quad: a.quad, curve: a.curve, score: a.det ? a.det.score : null, byLines: a.det ? !!a.det.byLines : null, msDetect: Math.round(t1 - t0), msProcess: Math.round(t2 - t1), fingers: res.fingers, outW: res.canvas.width, outH: res.canvas.height };
+  out.png = res.canvas.toDataURL('image/png');
+  if (opts.ocr !== false) {
+    const w = await getWorker(); const t3 = performance.now();
+    const { data } = await w.recognize(res.canvas, {}, { text: true, blocks: true });
+    out.msOcr = Math.round(performance.now() - t3);
+    out.text = data.text; out.conf = data.confidence;
+    out.parsedT6 = C.parseReceiptText(data.text);
+    out.parsedG6 = C.parseReceiptText(C.receiptLinesFromWords(ocrWords(data)).join('\n'));
+    if (opts.second !== false) {
+      await w.setParameters({ tessedit_pageseg_mode: '11' }); const t4 = performance.now();
+      const d2 = (await w.recognize(res.canvas, {}, { text: true, blocks: true })).data;
+      await w.setParameters({ tessedit_pageseg_mode: '6' }); out.msOcr2 = Math.round(performance.now() - t4);
+      out.lines11 = C.receiptLinesFromWords(ocrWords(d2)); out.parsedG11 = C.parseReceiptText(out.lines11.join('\n'));
+      out.parsedM = C.mergeReceiptReads(out.parsedT6, out.parsedG11);
+      out.parsedM3 = C.mergeReceiptReads(C.mergeReceiptReads(out.parsedT6, out.parsedG6), out.parsedG11);
+    }
+    out.parsed = out.parsedM || out.parsedT6;
+  }
+  return out;
+};
+</script>
+<script>
+window.dbgWS = async (url) => {
+  const cv = await loadImg(url); const seg = sSegmentWS(cv, cv.width, cv.height);
+  if (!seg) return null;
+  const { w, h, pm } = seg; const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d'); ctx.drawImage(cv, 0, 0, w, h); const id = ctx.getImageData(0, 0, w, h);
+  for (let i = 0; i < w * h; i++) { if (pm[i]) { id.data[i * 4 + 1] = Math.min(255, id.data[i * 4 + 1] + 70); } else { id.data[i * 4] *= 0.5; id.data[i * 4 + 1] *= 0.5; id.data[i * 4 + 2] *= 0.5; } }
+  ctx.putImageData(id, 0, 0);
+  const q = sQuadFromMask(pm, w, h); const lq = q ? sQuadLines(pm, w, h, q.q) : null;
+  return { png: c.toDataURL('image/png'), q: q && q.q, lq: lq && lq.q, blobA: seg.blobA, seedA: seg.seedA, area: seg.area, w, h };
+};
+</script>
+<script>
+window.stages = async (url) => {
+  const cv = await loadImg(url); const a = scanAutoDetect(cv); const quad = a.quad, curve = a.curve;
+  const side = scanTargetSide(cv, quad);
+  const warpedC = scanWarp(cv, quad, side, curve), flat = scanWarp(cv, quad, side, curveZero());
+  const sh = c => { const s = sInkSmall(c, 300); return sRowSharpness(s.ink, s.Wd, s.Hd, null); };
+  const shC = sh(warpedC), shF = sh(flat); const warped = shF > shC * 1.02 ? flat : warpedC;
+  const dk = scanDeskew(warped); const level = dk.canvas;
+  let st = level, passes = 0; for (let i = 0; i < 4; i++) { const nx = scanStraighten(st); if (nx === st) break; st = nx; passes++; }
+  const sm = c => { const k = 500 / Math.max(c.width, c.height); const o = document.createElement('canvas'); o.width = Math.round(c.width * k); o.height = Math.round(c.height * k); o.getContext('2d').drawImage(c, 0, 0, o.width, o.height); return o.toDataURL('image/png'); };
+  return { quad, curveMax: Math.max(...['t','r','b','l'].flatMap(k => curve[k].map(Math.abs))), shC, shF, angle: dk.angle, passes, w: sm(warped), l: sm(level), s: sm(st) };
+};
+</script>
+<script>
+window.ocrPSM = async (url, psm) => { const w = await getWorker(); await w.setParameters({ tessedit_pageseg_mode: String(psm) }); const t0 = performance.now(); const { data } = await w.recognize(url); await w.setParameters({ tessedit_pageseg_mode: '6' }); return { text: data.text, ms: Math.round(performance.now() - t0), parsed: C.parseReceiptText(data.text) }; };
+</script>
+<script>
+window.ocrScaled = async (url, scale, psm) => { const img = await loadImg(url, 99999); const c = document.createElement('canvas'); c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale); const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(img, 0, 0, c.width, c.height);
+  const w = await getWorker(); await w.setParameters({ tessedit_pageseg_mode: String(psm || 6) }); const t0 = performance.now(); const { data } = await w.recognize(c); await w.setParameters({ tessedit_pageseg_mode: '6' }); return { text: data.text, ms: Math.round(performance.now() - t0), parsed: C.parseReceiptText(data.text) }; };
+</script>
+<script>
+// Reconstruye renglones a partir de las palabras con su posición (tolera montos un poco más arriba o abajo)
+function linesFromWords(words) {
+  const ws = words.filter(w => w.text && w.text.trim()).map(w => ({ t: w.text.trim(), x0: w.bbox.x0, x1: w.bbox.x1, y0: w.bbox.y0, y1: w.bbox.y1, yc: (w.bbox.y0 + w.bbox.y1) / 2 }));
+  if (!ws.length) return [];
+  const hs = ws.filter(w => w.t.length >= 2).map(w => w.y1 - w.y0).sort((a, b) => a - b), H = hs[hs.length >> 1] || 20;
+  ws.sort((a, b) => a.yc - b.yc);
+  const rows = [];
+  for (const w of ws) {
+    let best = null, bd = 1e9;
+    for (const r of rows) { const dy = Math.abs(r.yc - w.yc); if (dy < H * 0.55 && dy < bd && !r.ws.some(o => !(w.x1 < o.x0 || w.x0 > o.x1))) { bd = dy; best = r; } }
+    if (best) { best.ws.push(w); best.yc = best.ws.reduce((s, o) => s + o.yc, 0) / best.ws.length; } else rows.push({ yc: w.yc, ws: [w] });
+  }
+  rows.sort((a, b) => a.yc - b.yc);
+  return rows.map(r => r.ws.sort((a, b) => a.x0 - b.x0).map(w => w.t).join(' '));
+}
+window.ocrGeo = async (url, psm) => { const w = await getWorker(); await w.setParameters({ tessedit_pageseg_mode: String(psm) }); const t0 = performance.now(); const { data } = await w.recognize(url, {}, { text: true, blocks: true }); await w.setParameters({ tessedit_pageseg_mode: '6' });
+  const words = ocrWords(data); const lines = linesFromWords(words); return { ms: Math.round(performance.now() - t0), lines, parsed: C.parseReceiptText(lines.join('\n')), parsedT: C.parseReceiptText(data.text) }; };
+</script>
+<script>
+window.dbgSkin = async (url) => { const cv = await loadImg(url); const S = sReadSmall(cv, cv.width, cv.height, 640), { d, w, h, n } = S, g = sWhiteGains(d, n);
+  const c = document.createElement('canvas'); c.width = w; c.height = h; const ctx = c.getContext('2d'); ctx.drawImage(cv, 0, 0, w, h); const id = ctx.getImageData(0, 0, w, h);
+  let cnt = 0; for (let i = 0; i < n; i++) { const r = Math.min(255, d[i*4]*g[0]), gg = Math.min(255, d[i*4+1]*g[1]), b = Math.min(255, d[i*4+2]*g[2]); if (sIsSkin(r, gg, b) || sIsWarm(r, gg, b)) { id.data[i*4] = 255; id.data[i*4+1] = 0; id.data[i*4+2] = 255; cnt++; } }
+  ctx.putImageData(id, 0, 0); return { png: c.toDataURL('image/png'), gains: g, cnt }; };
+</script>
+<script>
+window.timeWS = async (url) => { const cv = await loadImg(url); const out = {}; for (const s of [640, 400, 320]) { const t0 = performance.now(); let d; for (let i = 0; i < 3; i++) d = sDetectWS(cv, cv.width, cv.height, s); out[s] = { ms: Math.round((performance.now() - t0) / 3), ok: !!d, q: d && d.quad.map(p => p.map(Math.round)) }; } const t1 = performance.now(); scanDetect(cv, cv.width, cv.height); out.classic360 = Math.round(performance.now() - t1); return out; };
+</script>

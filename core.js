@@ -416,52 +416,199 @@
     const v = Number(int) + (dec ? Number(dec) / Math.pow(10, dec.length) : 0);
     return Number.isFinite(v) ? Math.round(v) : null;
   }
-  function lastAmount(line) {
-    const re = /[-–]?\$?\s?\d[\d.,]*/g; let m, last = null;
+  // Números de una línea con su posición. Se ignoran porcentajes, fechas/horas y números pegados a letras
+  // (códigos como S17E-56012 o 1_FAC).
+  function amountTokens(line) {
+    const re = /[-–]?\$?\s?\d[\d.,]*/g, out = []; let m;
     while ((m = re.exec(line))) {
-      const after = line.slice(m.index + m[0].length, m.index + m[0].length + 2);
-      if (/^\s?%/.test(after)) continue;               // porcentajes (19 %)
-      if (/[\/:]/.test(line.slice(Math.max(0, m.index - 1), m.index + m[0].length + 1))) continue; // fechas y horas
-      const tok = m[0].replace(/[.,]$/, '');
-      const v = parseAmountToken(tok);
-      if (v !== null) last = { value: v, index: m.index, raw: m[0], negative: /^[-–]/.test(m[0].trim()) };
+      const raw = m[0], lead = raw.search(/\d/), ds = m.index + lead;
+      let de = m.index + raw.length; while (de > ds && /[.,]/.test(line[de - 1])) de--;
+      const before = line[m.index - 1] || ' ', bd = line[ds - 1] || ' ', after = line[de] || ' ';
+      if (/[A-Za-zÁÉÍÓÚÑáéíóúñ_]/.test(before) && !/^\s/.test(raw)) continue;       // pegado a letras: código
+      if (/[\/:]/.test(bd) && !/\s/.test(raw.slice(0, lead)) || /[\/:]/.test(after)) continue; // fechas y horas (10/05/26, 13:40)
+      if (/^\s?%/.test(line.slice(de, de + 2))) continue;                            // porcentajes (19 %)
+      if (/[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(after) && !/[xX×]/.test(after)) continue;     // 1KG, 500MG, 4X
+      const tok = line.slice(ds, de), v = parseAmountToken(tok);
+      if (v === null) continue;
+      out.push({ value: v, index: m.index, end: de, raw: tok, sep: /\d[.,]\d{3}(?!\d)/.test(tok), negative: /^[-–]/.test(raw.trim()) && /[\s$(]/.test(before) });
     }
-    return last;
+    return out;
   }
+  function lastAmount(line) { const t = amountTokens(line); return t.length ? t[t.length - 1] : null; }
   function plain(s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); }
+  const LETTERS = /[A-Za-zÁÉÍÓÚÑáéíóúñ]/g;
+  const nLetters = s => (String(s).match(LETTERS) || []).length;
+  // Nombre de la tienda: "TIENDA KOAJ CALLE 12" → KOAJ; razón social (LTDA, S.A.S.) seguida de la marca → la marca
+  function receiptMerchant(lines) {
+    const ADDR = /\b(calle|cll|cl|carrera|cra|kr|avenida|av|diagonal|dg|transversal|tv|centro|cc|c\.c|local|piso|barrio|no|km)\b|#|\d/;
+    const SKIPM = /(nit|tel|ciudad|caja|factura|fecha|hora|cliente|vendedor|consecutivo|regimen|resoluci|iva|responsable|codigo|descripcion|direcci|www|\.com|cajero|turno)/;
+    const SUFFIX = /\b(ltda|limitada|s\.?\s?a\.?\s?s|s\.?a\.?|sas|e\.?u\.?|& cia|y cia)\b\.?/;
+    const cands = [], top = lines.slice(0, 12).map(l => l.replace(/€/g, '&'));
+    for (let k = 0; k < top.length; k++) {
+      const l = top[k], low = plain(l);
+      const t = /^tienda\s+(.+)$/.exec(low);
+      if (t) {
+        const words = []; for (const wd of t[1].split(/\s+/)) { if (ADDR.test(wd) && words.length) break; words.push(wd); }
+        const brand = l.split(/\s+/).slice(1, 1 + words.length).join(' ').replace(/[^\wÁÉÍÓÚÑáéíóúñ&'.\s-]/g, '').trim();
+        const full = top.slice(k + 1, k + 3).map(x => x.replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9&]+|[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9.&)]+$/g, '').trim()).find(x => x && !/\d/.test(x) && x.split(/\s+/).length <= 4 && plain(x).startsWith(plain(brand.split(' ')[0])));
+        if (full || brand) return full || brand;
+      }
+      if (SKIPM.test(low) || nLetters(l) < 3 || (l.match(/\d/g) || []).length > 4) continue;
+      if (lastAmount(l)) continue;
+      cands.push(l.replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9&]+|[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9.&)]+$/g, '').trim());
+      if (cands.length >= 4) break;
+    }
+    if (!cands.length) return null;
+    const first = cands[0];
+    if (SUFFIX.test(plain(first))) {
+      const brand = cands.slice(1, 3).find(c => !SUFFIX.test(plain(c)) && c.split(/\s+/).length <= 3 && !/\d/.test(c));
+      if (brand) return brand;
+      return first.replace(new RegExp(SUFFIX.source + '.*$', 'i'), '').trim() || first;
+    }
+    return first;
+  }
+  function receiptLinesFromWords(words) {
+    const ws = (words || []).filter(w => w && w.text && w.text.trim() && w.bbox).map(w => ({ t: w.text.trim(), x0: w.bbox.x0, x1: w.bbox.x1, yc: (w.bbox.y0 + w.bbox.y1) / 2, h: w.bbox.y1 - w.bbox.y0 }));
+    if (!ws.length) return [];
+    const hs = ws.filter(w => w.t.length >= 2).map(w => w.h).sort((a, b) => a - b), H = hs[hs.length >> 1] || 20;
+    ws.sort((a, b) => a.yc - b.yc);
+    const rows = [];
+    for (const w of ws) {
+      let best = null, bd = 1e9;
+      for (const r of rows) { const dy = Math.abs(r.yc - w.yc); if (dy < H * 0.55 && dy < bd && !r.ws.some(o => !(w.x1 < o.x0 || w.x0 > o.x1))) { bd = dy; best = r; } }
+      if (best) { best.ws.push(w); best.yc = best.ws.reduce((s, o) => s + o.yc, 0) / best.ws.length; } else rows.push({ yc: w.yc, ws: [w] });
+    }
+    rows.sort((a, b) => a.yc - b.yc);
+    return rows.map(r => r.ws.sort((a, b) => a.x0 - b.x0).map(w => w.t).join(' '));
+  }
+  // Une dos lecturas de la misma factura: cada dato se toma de la lectura en la que cuadra con los demás
+  function mergeReceiptReads(a, b) {
+    if (!a) return b; if (!b) return a;
+    const sumIt = r => r.items.reduce((s, i) => s + i.amount, 0) + (r.tip || 0) + (r.shipping || 0) - (r.discount || 0);
+    const votes = new Map(), add = (v, w) => { if (v) votes.set(v, (votes.get(v) || 0) + w); };
+    add(a.total, a.totalSource === 'sum' ? 0.5 : 2); add(b.total, b.totalSource === 'sum' ? 0.5 : 2); add(sumIt(a), 0.75); add(sumIt(b), 0.75);
+    if (a.subtotal && a.tax) add(a.subtotal + a.tax, 1); if (b.subtotal && b.tax) add(b.subtotal + b.tax, 1);
+    let total = a.total || b.total, bw = 0; for (const [v, w] of votes) if (w > bw || (w === bw && v === a.total)) { bw = w; total = v; }
+    const okTax = (t, s) => t && total && (Math.abs(t - (total - Math.round(total / 1.19))) <= 2 || (s && Math.abs(total - s - t) <= 2));
+    const tax = okTax(a.tax, a.subtotal) ? a.tax : okTax(b.tax, b.subtotal) ? b.tax : (a.tax || b.tax);
+    const okSub = s => s && total && s <= total && s >= total * 0.5;
+    const subtotal = okSub(a.subtotal) ? a.subtotal : okSub(b.subtotal) ? b.subtotal : (a.subtotal || b.subtotal);
+    const fits = r => r.items.length && Math.abs(sumIt(r) - total) <= 1;
+    const items = fits(a) ? a.items : fits(b) ? b.items : (b.items.length > a.items.length ? b.items : a.items);
+    return Object.assign({}, a, { total, tax, subtotal, items, date: a.date || b.date, merchant: a.merchant || b.merchant, nit: a.nit || b.nit, tip: a.tip ?? b.tip, discount: a.discount ?? b.discount, shipping: a.shipping ?? b.shipping });
+  }
   function parseReceiptText(text) {
-    const lines = String(text || '').split(/\r?\n/).map(l => l.replace(/\s+/g, ' ').trim()).filter(Boolean);
-    const r = { items: [], subtotal: null, tax: null, tip: null, discount: null, shipping: null, total: null, nit: null, date: null };
-    let taxSum = 0, tipSum = 0, discSum = 0, shipSum = 0, totalPay = null, total = null;
-    const SKIP = /(cambio|efectivo|recibido|tarjeta|debito|credito|visa|master|nequi|daviplata|vueltas|pago|cuotas|aprobacion|autoriz|redondeo|base|exento|excluido|gravado|bruto|neto|saldo|puntos|tel[eé]?f|telefono|fecha|hora|caja|cajero|factura|resolucion|nit|cufe|cliente|c\.?c\.?\b|items|articulos|unidades|regimen|direccion|cra\b|calle|kr\b)/;
-    for (const line of lines) {
-      const low = plain(line);
-      const nit = /nit[\s.:#-]*([\d.]{6,}[\s-]*\d?)/.exec(low); if (nit && !r.nit) r.nit = nit[1].replace(/\s/g, '');
-      const d = /(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/.exec(line);
-      if (d && !r.date) { let y = Number(d[3]); if (y < 100) y += 2000; const mo = Number(d[2]), dd = Number(d[1]); if (mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31) r.date = iso(y, mo, dd); }
-      const a = lastAmount(line);
-      if (!a || a.value === 0) continue;
+    const lines = String(text || '').split(/\r?\n/).map(l => l.replace(/[—–]+/g, ' ').replace(/[|“”"¦]/g, ' ').replace(/\s+/g, ' ').replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9$-]+/, '').trim()).filter(Boolean);
+    // Montos impresos medio renglón más arriba o más abajo que su etiqueta ("6280" / "Iva 19%"): se unen
+    const KV = /(sub\s*-?\s*t[o0]ta[l1]|t[o0]ta[l1]|\b[il1!]?va\b|impoconsumo|impuesto|propina|descuento|domicilio|cambio|efectivo|\btef\b|\bcred|\bdeb)/;
+    for (let j = 0; j < lines.length; j++) {
+      const l = lines[j]; if (nLetters(l) > 1) continue;
+      const tk = amountTokens(l); if (tk.length !== 1) continue;
+      const lab = k => k >= 0 && k < lines.length && KV.test(plain(lines[k])) && !amountTokens(lines[k]).some(t => t.value > 0) && nLetters(lines[k]) >= 3;
+      const to = lab(j + 1) ? j + 1 : lab(j - 1) ? j - 1 : -1;
+      if (to >= 0) { lines[to] = lines[to] + ' ' + tk[0].raw; lines.splice(j, 1); j--; }
+    }
+    const r = { items: [], subtotal: null, tax: null, tip: null, discount: null, shipping: null, total: null, nit: null, date: null, merchant: null };
+    let taxSum = 0, tipSum = 0, discSum = 0, shipSum = 0, totalPay = null, total = null, totalRow = null, payCard = null;
+    const SKIP = /(cambio|efectivo|recibido|tarjeta|debito|\bdeb\b|credito|\bcred\b|\btef\b|visa|master|nequi|daviplata|vueltas|pago|cuotas|aprobaci|autoriz|redondeo|\bbase\b|exent|excluid|gravad|bruto|\bneto\b|saldo|puntos|tel[eé]?f|telefono|\btel\b|fecha|hora|\bcaja\b|cajero|factura|resoluci|\bres\b|decreto|autorreten|retenedor|\bnit\b|consecutivo|vendedor|cliente|ciudad|\bcalle\b|carrera|\bcra\b|direcci|\bpiso\b|codigo|descripcion|\bunid|t\.unid|medio de|\bitems?\b|articulos|cantidad|\bcant\b)/;
+    const TAXW = /(\b[il1!|]?va\b|i\.v\.a|impoconsumo|imp\.?\s*consumo|\binc\b|impuesto|\bico\b)/;
+    const isHeader = low => /(cant|precio|valor|total|descripcion|codigo|dto|dcto)/.test(low) && !lastAmount(low);
+    let pendingQty = null;
+    for (let li = 0; li < lines.length; li++) {
+      const line = lines[li], low = plain(line);
+      const nit = /nit[\s.:#-]*([\d.]{6,}[\s-]*\d?)/.exec(low); if (nit && !r.nit && li < 8) r.nit = nit[1].replace(/\s/g, '');
+      const d = /(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})(?!\d)/.exec(line);
+      if (d && (!r.date || /fecha/.test(low))) { let y = Number(d[3]); if (y < 100) y += 2000; const mo = Number(d[2]), dd = Number(d[1]); if (y >= 2000 && y < 2100 && mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31 && (!r.date || /fecha/.test(low))) r.date = iso(y, mo, dd); }
+      const toks = amountTokens(line), a = toks[toks.length - 1];
+      // Fila de totales bajo un encabezado "... TOTAL" (ej.: "4 39.330 0 39.330")
+      if (li > 0 && /t[o0]ta[l1i]/.test(plain(lines[li - 1])) && isHeader(plain(lines[li - 1])) && a && nLetters(line) < 3) { totalRow = a.value; continue; }
+      if (!a || a.value === 0) { const q = /^(\d{1,3})\s*[xX×*]\s*$/.exec(line); if (q) pendingQty = Number(q[1]); continue; }
       const v = a.value;
-      if (/sub\s*-?\s*tot/.test(low)) { r.subtotal = v; continue; }
+      if (/sub\s*-?\s*t[o0]ta[l1]/.test(low)) { r.subtotal = v; continue; }
       if (/(propina|servicio voluntario|^servicio\b|\btip\b)/.test(low)) { tipSum += v; continue; }
       if (/(descuento|dcto|\bdesc\b|ahorro|promocion|rebaja)/.test(low)) { discSum += v; continue; }
       if (/(domicilio|\benvio\b|despacho|flete)/.test(low)) { shipSum += v; continue; }
-      if (/(\biva\b|impoconsumo|imp\.?\s*consumo|\binc\b|impuesto|\bico\b)/.test(low) && !/(base|excluido|exento|no gravado|antes|total)/.test(low)) { taxSum += v; continue; }
-      if (/total/.test(low)) { if (/a pagar|neto|factura|valor total|vr\.? ?total/.test(low)) totalPay = v; else if (!/(iva|impuesto|items|unidades|articulos|sub)/.test(low)) total = v; continue; }
-      if (SKIP.test(low)) continue;
+      if ((TAXW.test(low) || /\b(19|5|8)\s?%/.test(low)) && !/(base|excluid|exent|no gravad|antes|total|responsable|regimen)/.test(low)) { taxSum += v; continue; }
+      if (/t[o0]ta[l1i]/.test(low) && !/sub/.test(low)) { if (/a pagar|neto|factura|valor total|vr\.? ?total|total\s*:/.test(low)) totalPay = v; else if (!/(iva|impuesto|items|unidades|articulos|unid)/.test(low)) total = v; continue; }
+      // "2 x 3.500" y el producto en la línea siguiente
+      const qx = /^(\d{1,3})\s*[xX×*]\s*\$?\s*[\d.,]+$/.exec(line); if (qx && nLetters(line) <= 1) { pendingQty = Number(qx[1]); continue; }
+      if (/(\btef\b|tarjeta|credito|debito|\bcred\b|\bdeb\b|visa|master|nequi|daviplata|datafono|\bpse\b|transferencia)/.test(low) && !/(cambio|cuotas)/.test(low)) payCard = v;
+      if (SKIP.test(low)) { pendingQty = null; continue; }
+      // Producto en dos líneas: nombre (con código) y debajo la fila de números "948 08 94 1 29.940 29.940"
+      const next = lines[li + 1], nextToks = next ? amountTokens(next).filter(t => t.value >= 100 || t.raw.length <= 2) : [];
+      const nameOnly = nLetters(line) >= 3 && (!a.sep && (a.value >= 1000 || /\d\/\d/.test(line.slice(a.index))) || /^\d{6,}/.test(line));
+      while (nextToks.length && nextToks[nextToks.length - 1].value < 100) nextToks.pop(); // "4.70": dígito perdido al final
+      if (nameOnly && next && nLetters(next) < 3 && nextToks.length && nextToks[nextToks.length - 1].value >= 100) {
+        const nt = nextToks, tot = nt[nt.length - 1].value, price = nt.length >= 2 ? nt[nt.length - 2].value : null;
+        let qty = 1; if (nt.length >= 3 && nt[nt.length - 3].value >= 1 && nt[nt.length - 3].value <= 99 && price && Math.abs(price * nt[nt.length - 3].value - tot) <= 1) qty = nt[nt.length - 3].value;
+        let name = line.replace(/^\s*\d{4,}\s*/, '').replace(/(\s+\d[\d\/.,-]*)+\s*\S?$/, '').replace(/\s{2,}/g, ' ').trim();
+        if (nLetters(name) >= 3) {
+          const alts = [tot]; if (price) { if (nt.length >= 3 && nt[nt.length - 3].value <= 99) alts.push(price * nt[nt.length - 3].value); alts.push(price); }
+          r.items.push({ name: name.slice(0, 60), qty, amount: tot, alts: [...new Set(alts.filter(x => x >= 100))] });
+        }
+        li++; pendingQty = null; continue;
+      }
       if (v < 100) continue; // ningún producto cuesta menos de $100: es un número de dirección, NIT o similar
       let name = line.slice(0, a.index).replace(/^\s*\d{4,}\s*/, '').replace(/[$*]+\s*$/, '').trim();
-      let qty = 1;
+      let qty = pendingQty || 1; pendingQty = null;
+      // "NOMBRE  2  7.000" o "NOMBRE 2 3.500 7.000" (cantidad, precio, total)
+      const alts = [v];
+      if (toks.length >= 2) { const p2 = toks[toks.length - 2]; if (p2.value >= 1 && p2.value <= 99 && name.endsWith(p2.raw)) { qty = p2.value; name = name.slice(0, name.length - p2.raw.length).trim(); } else if (p2.value >= 100 && toks.length >= 3 && toks[toks.length - 3].value <= 99 && Math.abs(p2.value * toks[toks.length - 3].value - v) <= 1) { qty = toks[toks.length - 3].value; alts.push(p2.value * qty); name = line.slice(0, toks[toks.length - 3].index).trim(); } }
       const q = /^(\d{1,3})\s*(?:x|un|und|unid|\*)\s+/i.exec(name) || /^(\d{1,2})\s+(?=[A-Za-zÁÉÍÓÚÑáéíóúñ])/.exec(name) || /\s(\d{1,3})\s*(?:x|un|und|unid)\s*$/i.exec(name);
       if (q) { qty = Number(q[1]); name = name.replace(q[0], ' ').trim(); }
-      name = name.replace(/^(?:[x×*]+\s+)+/i, '').replace(/\s{2,}/g, ' ').replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9]+/, '').trim();
-      if ((name.match(/[A-Za-zÁÉÍÓÚÑáéíóúñ]/g) || []).length < 3) continue;
+      name = name.replace(/^(?:[x×*]+\s+)+/i, '').replace(/\s{2,}/g, ' ').replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9]+/, '').replace(/[\s.:=-]+$/, '').trim();
+      if (nLetters(name) < 3) continue;
       if (a.negative) { discSum += v; continue; }
-      r.items.push({ name: name.slice(0, 60), qty, amount: v });
+      r.items.push({ name: name.slice(0, 60), qty, amount: v, alts });
     }
-    if (taxSum) r.tax = taxSum; if (tipSum) r.tip = tipSum; if (discSum) r.discount = discSum; if (shipSum) r.shipping = shipSum;
-    r.total = totalPay ?? total;
-    if (r.total === null && r.items.length) r.total = sum(r.items.map(i => i.amount)) + (r.tax && !r.subtotal ? 0 : 0) + (r.tip || 0) + (r.shipping || 0) - (r.discount || 0);
+    if (tipSum) r.tip = tipSum; if (discSum) r.discount = discSum; if (shipSum) r.shipping = shipSum;
+    // Total por votación entre fuentes independientes (un número mal leído o tapado por un dedo no decide solo)
+    {
+      const c = new Map(), add = (v, wgt) => { if (v && v >= 100) c.set(v, (c.get(v) || 0) + wgt); };
+      add(totalPay, 3); add(total, 2.5); add(totalRow, 2); add(payCard, 2);
+      if (r.subtotal && taxSum) add(r.subtotal + taxSum, 1.5);
+      const isum = r.items.reduce((s, i) => s + i.amount, 0); add(isum + (tipSum || 0) + (shipSum || 0) - (discSum || 0), 1);
+      const cand = r.items.filter(i => ![totalPay, total, totalRow, payCard].includes(i.amount));
+      const maxItem = Math.max(0, ...cand.map(i => Math.min(i.amount, ...(i.alts || [i.amount]))));
+      let best = null, bw = 0;
+      for (const [v, wgt] of c) {
+        const plaus = v >= maxItem && (!r.subtotal || v >= r.subtotal * 0.98 || r.subtotal > v * 2) && (!maxItem || v <= maxItem * 40) && v < 1e9;
+        const s = wgt + (plaus ? 0 : -2.5); if (s > bw) { bw = s; best = v; }
+      }
+      r.total = bw > 0 ? best : null;
+      r.totalSource = r.total === null ? null : [totalPay, total, totalRow, payCard].includes(r.total) ? 'line' : 'sum';
+    }
+    // El IVA se valida contra el total (19 % incluido): corrige lecturas como "Sua 19%" o un dígito perdido
+    if (r.total && taxSum > r.total * 0.3) { // ese valor era el subtotal (quedó junto a la etiqueta equivocada)
+      if (Math.abs(taxSum - Math.round(r.total / 1.19)) <= 2 && (!r.subtotal || r.subtotal > r.total)) { r.subtotal = taxSum; taxSum = r.total - taxSum; } else taxSum = 0;
+    }
+    if (r.total) {
+      const exp19 = r.total - Math.round(r.total / 1.19);
+      if (taxSum && Math.abs(taxSum - exp19) > 2 && (!r.subtotal || Math.abs(r.total - r.subtotal - taxSum) > 2)) {
+        if (r.subtotal && Math.abs(r.total - r.subtotal - exp19) <= 2) taxSum = exp19;                       // "6290" con subtotal que cuadra
+        else if (!r.subtotal && Math.abs(taxSum - exp19) <= Math.max(10, exp19 * 0.01) && String(taxSum).length === String(exp19).length) taxSum = exp19; // un dígito errado
+      }
+      if (r.subtotal && (r.subtotal > r.total || r.subtotal < r.total * 0.5) && taxSum && Math.abs(r.total - taxSum - Math.round(r.total / 1.19)) <= 2) r.subtotal = r.total - taxSum;
+    }
+    if (taxSum) r.tax = taxSum;
+    // Productos: cuadrar con el total probando las alternativas de cada línea (un dígito mal leído)
+    if (r.total && r.items.length) {
+      const targets = [r.total, r.total - (r.tip || 0) - (r.shipping || 0) + (r.discount || 0)];
+      const sumNow = r.items.reduce((s, i) => s + i.amount, 0);
+      if (!targets.includes(sumNow) && r.items.length <= 12) {
+        const opts = r.items.map(i => [...new Set([i.amount, ...(i.alts || [])])]);
+        let found = null;
+        const dfs = (k, acc, pick) => { if (found) return; if (k === opts.length) { if (targets.includes(acc)) found = pick.slice(); return; } for (const o of opts[k]) { pick.push(o); dfs(k + 1, acc + o, pick); pick.pop(); } };
+        if (opts.reduce((p, o) => p * o.length, 1) <= 4096) dfs(0, 0, []);
+        if (found) r.items.forEach((it, k) => { it.amount = found[k]; });
+      }
+      r.items = r.items.filter(i => i.amount <= r.total * 1.02);
+      // filas de totales o pagos leídas como producto
+      if (r.items.length > 1) r.items = r.items.filter(i => i.amount !== r.total && i.amount !== r.subtotal && i.amount !== r.tax);
+    }
+    r.items.forEach(i => delete i.alts);
+    if (r.total === null && r.items.length) r.total = sum(r.items.map(i => i.amount)) + (r.tip || 0) + (r.shipping || 0) - (r.discount || 0);
+    r.merchant = receiptMerchant(lines);
     return r;
   }
 
@@ -547,7 +694,7 @@
     attributeToPeople, txEffects, isActive, accountBalance, personalAmount, receivableParts, expenseInMonth, incomeInMonth, installmentStatus,
     loanTotalInterest, loanSchedule, loanSummary, allocatePayment,
     budgetBase, budgetStatus, txMatchesScope, goalSummary, wishPlan, wishMonthly,
-    duplicateScore, parsePastedText, parseReceiptText, parseAmountToken, csvSafe, toCSV, parseCSV, parseDateFlexible,
+    duplicateScore, parsePastedText, parseReceiptText, receiptLinesFromWords, mergeReceiptReads, parseAmountToken, csvSafe, toCSV, parseCSV, parseDateFlexible,
     encryptBackup, decryptBackup, hashPin, b64, unb64
   };
   root.WWCore = api;

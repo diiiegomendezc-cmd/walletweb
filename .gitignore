@@ -1,1 +1,5 @@
 .DS_Store
+tools/scanlab/imgs/
+tools/scanlab/gt/
+tools/scanlab/out/
+__pycache__/

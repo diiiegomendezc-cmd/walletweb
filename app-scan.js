@@ -19,10 +19,26 @@ function sBoxBlur(src, w, h, r) {
 }
 // Máximo / mínimo en ventana cuadrada (separable)
 function sMorph(src, w, h, r, isMax) {
+  if (r >= 3) return sMorphFast(src, w, h, r, isMax);
   const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
   const pick = isMax ? Math.max : Math.min;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = src[y * w + x]; for (let k = Math.max(0, x - r); k <= Math.min(w - 1, x + r); k++) v = pick(v, src[y * w + k]); tmp[y * w + x] = v; }
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = tmp[y * w + x]; for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r); k++) v = pick(v, tmp[k * w + x]); out[y * w + x] = v; }
+  return out;
+}
+function sMorphFast(src, w, h, r, isMax) {
+  const k = 2 * r + 1, tmp = new Float32Array(w * h), out = new Float32Array(w * h), pick = isMax ? (a, b) => (a > b ? a : b) : (a, b) => (a < b ? a : b);
+  const pass = (get, set, len, count) => {
+    const L = len + 2 * r, g = new Float32Array(L), hh = new Float32Array(L), f = new Float32Array(L);
+    for (let c = 0; c < count; c++) {
+      for (let i = 0; i < L; i++) { const j = Math.max(0, Math.min(len - 1, i - r)); f[i] = get(c, j); }
+      for (let i = 0; i < L; i++) g[i] = i % k === 0 ? f[i] : pick(g[i - 1], f[i]);
+      for (let i = L - 1; i >= 0; i--) hh[i] = (i === L - 1 || (i + 1) % k === 0) ? f[i] : pick(hh[i + 1], f[i]);
+      for (let i = 0; i < len; i++) set(c, i, pick(hh[i], g[i + 2 * r]));
+    }
+  };
+  pass((y, x) => src[y * w + x], (y, x, v) => { tmp[y * w + x] = v; }, w, h);
+  pass((x, y) => tmp[y * w + x], (x, y, v) => { out[y * w + x] = v; }, h, w);
   return out;
 }
 // Piel (dedos) en espacio YCbCr: excluye papel blanco o amarillento
@@ -163,12 +179,170 @@ function sEvalSeg(seg, w, h, range) {
   return { quality, rect, sep, sharp, qd };
 }
 const _vlist = ['white', 'gray', 'diff'];
+/* ---------- Detección del papel por su texto + inundación (watershed) ----------
+   Pensada para tirillas sostenidas en la mano, sobre paredes blancas, mesas claras, madera o ropa:
+   1) Se busca dónde hay texto impreso: trazos oscuros y finos sobre fondo claro y poco saturado
+      (en la pared, la madera, la ropa o la piel no hay eso). Esa zona es "papel seguro".
+   2) "Fondo seguro": el borde de la foto lejos del texto, la piel (dedos, palma) y lo muy saturado u oscuro.
+   3) Desde ambas semillas se inunda la imagen por orden de intensidad del borde: la frontera queda en el
+      contorno real del papel aunque el papel y la pared sean casi del mismo blanco. */
+function sIsWarm(r, g, b) { return r > g && g >= b && r - b > 30 && r > 70 && r < 250 && (r - b) / r > 0.14; }
+function sWatershed(G, w, h, lab) {
+  const n = w * h, buckets = Array.from({ length: 256 }, () => []), inq = new Uint8Array(n), nq = new Int32Array(4);
+  const nb = p => { const x = p % w; let k = 0; if (x > 0) nq[k++] = p - 1; if (x < w - 1) nq[k++] = p + 1; if (p >= w) nq[k++] = p - w; if (p < n - w) nq[k++] = p + w; return k; };
+  for (let p = 0; p < n; p++) if (lab[p]) { const k = nb(p); for (let j = 0; j < k; j++) { const q = nq[j]; if (!lab[q] && !inq[q]) { inq[q] = 1; buckets[G[q]].push(q); } } }
+  for (let lv = 0; lv < 256; lv++) {
+    const bk = buckets[lv];
+    for (let i = 0; i < bk.length; i++) {
+      const p = bk[i]; let l = 0, k = nb(p);
+      for (let j = 0; j < k; j++) if (lab[nq[j]]) { l = lab[nq[j]]; break; }
+      lab[p] = l || 2;
+      k = nb(p);
+      for (let j = 0; j < k; j++) { const q = nq[j]; if (!lab[q] && !inq[q]) { inq[q] = 1; const g = G[q]; (g < lv ? bk : buckets[g]).push(q); } }
+    }
+    buckets[lv] = null;
+  }
+  return lab;
+}
+function sSegmentWS(source, sw, sh, side) {
+  const S = sReadSmall(source, sw, sh, side || 640), { d, w, h, n } = S, gains = sWhiteGains(d, n);
+  const L = new Float32Array(n), sat = new Float32Array(n), skin = new Uint8Array(n), Rc = new Float32Array(n), Bc = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const r = Math.min(255, d[i * 4] * gains[0]), g = Math.min(255, d[i * 4 + 1] * gains[1]), b = Math.min(255, d[i * 4 + 2] * gains[2]);
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    L[i] = 0.299 * r + 0.587 * g + 0.114 * b; sat[i] = mx > 0 ? (mx - mn) / mx : 0; Rc[i] = r - g; Bc[i] = (r + g) / 2 - b;
+    skin[i] = sIsSkin(r, g, b) || sIsWarm(r, g, b) ? 1 : 0;
+  }
+  // 1) Trazos de texto: "sombrero negro" (cierre − imagen) sobre fondo claro y neutro
+  const r1 = Math.max(2, Math.round(w / 170));
+  const clo = sMorph(sMorph(L, w, h, r1, true), w, h, r1, false);
+  const satB = sBoxBlur(sat, w, h, Math.max(2, r1 * 2));
+  const stroke = new Float32Array(n);
+  for (let i = 0; i < n; i++) stroke[i] = (clo[i] - L[i] > 16 && clo[i] > 105 && satB[i] < 0.22 && !skin[i]) ? 1 : 0;
+  const R = Math.max(6, Math.round(w / 40));
+  const dens = sBoxBlur(stroke, w, h, R);
+  // zona de texto más fuerte (componente con más "tinta")
+  const lab0 = new Int32Array(n), stack = new Int32Array(n); let best = 0, bestScore = 0, id = 0; const scores = [0], boxes = [null];
+  for (let s = 0; s < n; s++) {
+    if (lab0[s] || dens[s] < 0.045) continue;
+    id++; let sp = 0, sc = 0; stack[sp++] = s; lab0[s] = id; const bx = [w, h, 0, 0];
+    while (sp) { const p = stack[--sp]; sc += dens[p]; const x = p % w, y = (p / w) | 0; if (x < bx[0]) bx[0] = x; if (y < bx[1]) bx[1] = y; if (x > bx[2]) bx[2] = x; if (y > bx[3]) bx[3] = y;
+      if (x > 0 && !lab0[p - 1] && dens[p - 1] >= 0.045) { lab0[p - 1] = id; stack[sp++] = p - 1; }
+      if (x < w - 1 && !lab0[p + 1] && dens[p + 1] >= 0.045) { lab0[p + 1] = id; stack[sp++] = p + 1; }
+      if (p >= w && !lab0[p - w] && dens[p - w] >= 0.045) { lab0[p - w] = id; stack[sp++] = p - w; }
+      if (p < n - w && !lab0[p + w] && dens[p + w] >= 0.045) { lab0[p + w] = id; stack[sp++] = p + w; } }
+    scores.push(sc); boxes.push(bx); if (sc > bestScore) { bestScore = sc; best = id; }
+  }
+  if (!best || bestScore < n * 0.004) return null; // no hay texto suficiente: que decida el método clásico
+  // Otros bloques de texto alineados con el principal (encabezado separado por un renglón en blanco, pie de página)
+  const keep = new Uint8Array(id + 1); keep[best] = 1;
+  const mb = boxes[best], mh = mb[3] - mb[1] + 1;
+  for (let k = 1; k <= id; k++) {
+    if (k === best || scores[k] < bestScore * 0.04) continue;
+    const b = boxes[k], ov = Math.min(b[2], mb[2]) - Math.max(b[0], mb[0]), wmin = Math.min(b[2] - b[0], mb[2] - mb[0]) + 1;
+    const gap = Math.max(0, b[1] - mb[3], mb[1] - b[3]);
+    if (ov >= wmin * 0.5 && gap <= Math.max(R * 3, mh * 0.3)) keep[k] = 1;
+  }
+  const blob = new Float32Array(n); let blobA = 0; for (let i = 0; i < n; i++) if (keep[lab0[i]]) { blob[i] = 1; blobA++; }
+  const seedP = sMorph(blob, w, h, Math.round(R * 0.9), false);      // papel seguro (dentro del texto)
+  const nearP = sMorph(blob, w, h, Math.round(R * 3), true);          // zona donde el borde de la foto puede ser papel
+  // 2) Fondo seguro
+  const lab = new Uint8Array(n);
+  const skinE = sMorph(Float32Array.from(skin), w, h, 2, false);
+  const satE = new Float32Array(n); for (let i = 0; i < n; i++) satE[i] = (sat[i] > 0.42 || L[i] < 45) ? 1 : 0;
+  const satEE = sMorph(satE, w, h, 2, false);
+  for (let i = 0; i < n; i++) { if (skinE[i] || (satEE[i] && !nearP[i])) lab[i] = 2; }
+  for (let x = 0; x < w; x++) for (const y of [0, h - 1]) { const p = y * w + x; if (!nearP[p]) lab[p] = 2; }
+  for (let y = 0; y < h; y++) for (const x of [0, w - 1]) { const p = y * w + x; if (!nearP[p]) lab[p] = 2; }
+  let seedA = 0; for (let i = 0; i < n; i++) if (seedP[i] && !skin[i]) { lab[i] = 1; seedA++; }
+  if (seedA < 20) return null;
+  // 3) Intensidad de borde (brillo + color) sobre la imagen suavizada
+  const Lb = sBoxBlur(L, w, h, 1), Rb = sBoxBlur(Rc, w, h, 1), Bb = sBoxBlur(Bc, w, h, 1), G = new Uint8Array(n);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const p = y * w + x;
+    const gx = (a, k) => a[k + 1] - a[k - 1], gy = (a, k) => a[k + w] - a[k - w];
+    const gl = Math.hypot(gx(Lb, p), gy(Lb, p)), gc = Math.hypot(gx(Rb, p), gy(Rb, p)) + Math.hypot(gx(Bb, p), gy(Bb, p));
+    G[p] = Math.min(255, Math.round((gl + 0.8 * gc) * 2));
+  }
+  sWatershed(G, w, h, lab);
+  // papel = etiqueta 1; se rellenan huecos (logos de color, sellos) y se queda el componente principal
+  const pm = new Uint8Array(n); for (let i = 0; i < n; i++) pm[i] = lab[i] === 1 ? 1 : 0;
+  const hole = new Int32Array(n); let hid = 0;
+  for (let s = 0; s < n; s++) {
+    if (pm[s] || hole[s]) continue;
+    hid++; let sp = 0, touch = false, sk = 0; const px = []; stack[sp++] = s; hole[s] = hid;
+    while (sp) { const p = stack[--sp]; px.push(p); const x = p % w, y = (p / w) | 0; if (x === 0 || y === 0 || x === w - 1 || y === h - 1) touch = true; if (skin[p]) sk++;
+      if (x > 0 && !pm[p - 1] && !hole[p - 1]) { hole[p - 1] = hid; stack[sp++] = p - 1; }
+      if (x < w - 1 && !pm[p + 1] && !hole[p + 1]) { hole[p + 1] = hid; stack[sp++] = p + 1; }
+      if (y > 0 && !pm[p - w] && !hole[p - w]) { hole[p - w] = hid; stack[sp++] = p - w; }
+      if (y < h - 1 && !pm[p + w] && !hole[p + w]) { hole[p + w] = hid; stack[sp++] = p + w; } }
+    if (!touch && sk < px.length * 0.5) for (const p of px) pm[p] = 1;
+  }
+  // suavizado leve (quita hilos de unión con el fondo)
+  const pmo = sMorph(sMorph(Float32Array.from(pm), w, h, 1, false), w, h, 1, true);
+  const comp = new Int32Array(n); let cbest = 0, cbestA = 0, cid = 0;
+  for (let s = 0; s < n; s++) {
+    if (!pmo[s] || comp[s]) continue;
+    cid++; let sp = 0, a = 0, hasSeed = 0; stack[sp++] = s; comp[s] = cid;
+    while (sp) { const p = stack[--sp]; a++; if (seedP[p]) hasSeed++; const x = p % w;
+      if (x > 0 && pmo[p - 1] && !comp[p - 1]) { comp[p - 1] = cid; stack[sp++] = p - 1; }
+      if (x < w - 1 && pmo[p + 1] && !comp[p + 1]) { comp[p + 1] = cid; stack[sp++] = p + 1; }
+      if (p >= w && pmo[p - w] && !comp[p - w]) { comp[p - w] = cid; stack[sp++] = p - w; }
+      if (p < n - w && pmo[p + w] && !comp[p + w]) { comp[p + w] = cid; stack[sp++] = p + w; } }
+    if (hasSeed && a > cbestA) { cbestA = a; cbest = cid; }
+  }
+  if (!cbest) return null;
+  const mask = new Uint8Array(n); let area = 0; for (let i = 0; i < n; i++) if (comp[i] === cbest) { mask[i] = 1; area++; }
+  return { pm: mask, w, h, k: S.k, area, F: Lb, blobA, seedA };
+}
+// Rectángulo de área mínima que envuelve el papel (no se deja engañar por mordidas de dedos ni sombras)
+function sMinRectQuad(pm, w, h) {
+  const pts = [];
+  for (let y = 0; y < h; y += 2) { let x0 = -1, x1 = -1; for (let x = 0; x < w; x++) if (pm[y * w + x]) { if (x0 < 0) x0 = x; x1 = x; } if (x0 >= 0) { pts.push([x0, y], [x1 + 1, y]); } }
+  if (pts.length < 6) return null;
+  pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], up = [];
+  for (const p of pts) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+  for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+  const hull = lo.slice(0, -1).concat(up.slice(0, -1));
+  let best = null;
+  for (let i = 0; i < hull.length; i++) {
+    const a = hull[i], b = hull[(i + 1) % hull.length], L = Math.hypot(b[0] - a[0], b[1] - a[1]); if (L < 1e-6) continue;
+    const ux = (b[0] - a[0]) / L, uy = (b[1] - a[1]) / L; let u0 = 1e9, u1 = -1e9, v0 = 1e9, v1 = -1e9;
+    for (const p of hull) { const u = p[0] * ux + p[1] * uy, v = -p[0] * uy + p[1] * ux; if (u < u0) u0 = u; if (u > u1) u1 = u; if (v < v0) v0 = v; if (v > v1) v1 = v; }
+    const ar = (u1 - u0) * (v1 - v0); if (!best || ar < best.ar) best = { ar, ux, uy, u0, u1, v0, v1 };
+  }
+  if (!best) return null;
+  const { ux, uy, u0, u1, v0, v1 } = best, P = (u, v) => [u * ux - v * uy, u * uy + v * ux];
+  const q = [P(u0, v0), P(u1, v0), P(u1, v1), P(u0, v1)];
+  const cx = q.reduce((s, p) => s + p[0], 0) / 4, cy = q.reduce((s, p) => s + p[1], 0) / 4;
+  q.sort((p, r) => Math.atan2(p[1] - cy, p[0] - cx) - Math.atan2(r[1] - cy, r[0] - cx));
+  let st = 0, sb = Infinity; q.forEach((p, i) => { const s = p[0] + p[1]; if (s < sb) { sb = s; st = i; } });
+  const qq = [0, 1, 2, 3].map(i => q[(st + i) % 4]);
+  return { q: qq, area: sPolyArea(qq) };
+}
+function sDetectWS(source, sw, sh, side) {
+  const seg = sSegmentWS(source, sw, sh, side); if (!seg) return null;
+  const { pm, w, h, k, area } = seg;
+  if (area < w * h * 0.02) return null;
+  let qd = sQuadFromMask(pm, w, h); if (!qd) return null;
+  let byLines = false;
+  const mr = sMinRectQuad(pm, w, h);
+  // rectas por cada lado partiendo del rectángulo mínimo; una segunda pasada con las esquinas ya corregidas
+  let lq = mr ? sQuadLines(pm, w, h, mr.q) : null; if (lq) lq = sQuadLines(pm, w, h, lq.q) || lq;
+  if (!lq) lq = sQuadLines(pm, w, h, qd.q);
+  if (lq && area / lq.area >= 0.78 && lq.area >= area * 0.97) { qd = lq; byLines = true; }
+  else if (mr && area / mr.area >= 0.8) qd = mr;
+  const quad = qd.q.map(([x, y]) => [x / k, y / k]), rect = Math.min(1, area / qd.area);
+  return { quad, byLines, score: Math.max(0.65, rect), cover: area / (w * h), edgeRatio: 1, view: 'ws', mask: { m: pm, w, h, k, F: seg.F } };
+}
 /* Esquinas por rectas (como los escáneres de Adobe y Samsung): cada lado del papel se ajusta como una recta
    usando solo la parte del borde que se ve bien (RANSAC), y las esquinas son los cruces de esas rectas.
    Así una esquina en sombra, doblada o tapada por un dedo no deforma el recorte. */
 function sQuadLines(pm, w, h, q0) {
   const bd = [];
-  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) { const p = y * w + x; if (pm[p] && (!pm[p - 1] || !pm[p + 1] || !pm[p - w] || !pm[p + w])) bd.push(x + 0.5, y + 0.5); }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const p = y * w + x; if (pm[p] && (x === 0 || y === 0 || x === w - 1 || y === h - 1 || !pm[p - 1] || !pm[p + 1] || !pm[p - w] || !pm[p + w])) bd.push(x + 0.5, y + 0.5); }
   if (bd.length < 80) return null;
   const lines = [];
   for (let s = 0; s < 4; s++) {
@@ -194,8 +368,24 @@ function sQuadLines(pm, w, h, q0) {
     const th = 0.5 * Math.atan2(2 * sxy, sxx - syy); lines.push({ x: mx, y: my, dx: Math.cos(th), dy: Math.sin(th) });
   }
   const cross = (l1, l2) => { const den = l1.dx * l2.dy - l1.dy * l2.dx; if (Math.abs(den) < 1e-6) return null; const t = ((l2.x - l1.x) * l2.dy - (l2.y - l1.y) * l2.dx) / den; return [l1.x + l1.dx * t, l1.y + l1.dy * t]; };
+  // Si un lado es el borde de la foto (la tirilla sigue por fuera), ese lado se traza paralelo al lado opuesto
+  // por el punto de papel visible más lejano: así el recorte no tuerce los renglones de una tirilla inclinada.
+  let cut = false;
+  for (let s = 0; s < 4; s++) {
+    const l = lines[s], onB = (Math.abs(l.dy) < 0.02 && (l.y < 2 || l.y > h - 3)) || (Math.abs(l.dx) < 0.02 && (l.x < 2 || l.x > w - 3));
+    if (!onB) continue;
+    // dirección: perpendicular al promedio de los dos lados largos vecinos (más confiables que el borde opuesto)
+    const a1 = lines[(s + 1) % 4], a2 = lines[(s + 3) % 4];
+    let mx = a1.dx + (a1.dx * a2.dx + a1.dy * a2.dy >= 0 ? a2.dx : -a2.dx), my = a1.dy + (a1.dx * a2.dx + a1.dy * a2.dy >= 0 ? a2.dy : -a2.dy);
+    const ml = Math.hypot(mx, my) || 1; mx /= ml; my /= ml;
+    const dx = -my, dy = mx, o = lines[(s + 2) % 4];
+    let nx = mx, ny = my; const sg = ((l.x - o.x) * nx + (l.y - o.y) * ny) >= 0 ? 1 : -1; nx *= sg; ny *= sg;
+    let far = -1e9, fp = null;
+    for (let i = 0; i < bd.length; i += 2) { const dd = (bd[i] - o.x) * nx + (bd[i + 1] - o.y) * ny; if (dd > far) { far = dd; fp = [bd[i], bd[i + 1]]; } }
+    if (fp) { lines[s] = { x: fp[0], y: fp[1], dx, dy }; cut = true; }
+  }
   const q = [0, 1, 2, 3].map(i => cross(lines[(i + 3) % 4], lines[i]));
-  if (q.some(p => !p || p[0] < -w * 0.08 || p[1] < -h * 0.08 || p[0] > w * 1.08 || p[1] > h * 1.08)) return null;
+  if (q.some(p => !p || p[0] < -w * (cut ? 0.6 : 0.08) || p[1] < -h * (cut ? 0.6 : 0.08) || p[0] > w * (cut ? 1.6 : 1.08) || p[1] > h * (cut ? 1.6 : 1.08))) return null;
   // convexo y con la misma orientación que el original
   const crossZ = i => { const a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4]; return (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]); };
   const sg = Math.sign(crossZ(0)); if ([1, 2, 3].some(i => Math.sign(crossZ(i)) !== sg)) return null;
@@ -203,6 +393,7 @@ function sQuadLines(pm, w, h, q0) {
 }
 function scanDetect(source, sw, sh, maxSide) {
   maxSide = maxSide || 360;
+  if (maxSide > 360) { const ws = sDetectWS(source, sw, sh); if (ws) return ws; } // foto: primero el método por texto
   // Paso 1: elegir vista y umbral a baja resolución
   const S = sReadSmall(source, sw, sh, 360), gains = sWhiteGains(S.d, S.n), Fs = sFeatures(S.d, S.w, S.h, gains);
   const sc0 = S.w / 360, rc0 = Math.max(2, Math.round(2 * sc0)), bl0 = Math.max(1, Math.round(2 * sc0));
@@ -372,8 +563,10 @@ function scanWarp(srcCanvas, quad, maxSide, curve) {
     for (let u = 0; u < W; u++) {
       const uu = (u + 0.5) / W, px = uu + (1 - uu) * cl[v] + uu * cr[v], py = vv + (1 - vv) * ct[u] + vv * cb[u];
       const z = Hm[6] * px + Hm[7] * py + 1, x = (Hm[0] * px + Hm[1] * py + Hm[2]) / z - 0.5, y = (Hm[3] * px + Hm[4] * py + Hm[5]) / z - 0.5;
+      const oi = (v * W + u) * 4;
+      if (x < -1 || y < -1 || x > sw || y > sh) { o[oi] = o[oi + 1] = o[oi + 2] = 250; o[oi + 3] = 255; continue; } // la tirilla sigue fuera de la foto
       const x0 = Math.max(0, Math.min(sw - 2, Math.floor(x))), y0 = Math.max(0, Math.min(sh - 2, Math.floor(y))), fx = Math.max(0, Math.min(1, x - x0)), fy = Math.max(0, Math.min(1, y - y0));
-      const i00 = (y0 * sw + x0) * 4, i10 = i00 + 4, i01 = i00 + sw * 4, i11 = i01 + 4, oi = (v * W + u) * 4;
+      const i00 = (y0 * sw + x0) * 4, i10 = i00 + 4, i01 = i00 + sw * 4, i11 = i01 + 4;
       for (let c = 0; c < 3; c++) o[oi + c] = (sd[i00 + c] * (1 - fx) + sd[i10 + c] * fx) * (1 - fy) + (sd[i01 + c] * (1 - fx) + sd[i11 + c] * fx) * fy;
       o[oi + 3] = 255;
     }
@@ -407,8 +600,8 @@ function scanDeskew(canvas) {
     let e = 0; for (let i = 0; i < D; i++) e += prof[i] * prof[i]; return e;
   };
   let best = 0, bs = score(0);
-  for (let a = -40; a <= 40; a += 1) { const s = score(a); if (s > bs) { bs = s; best = a; } }
-  for (let a = best - 1; a <= best + 1.001; a += 0.1) { const s = score(a); if (s > bs) { bs = s; best = a; } }
+  for (let a = -20; a <= 20; a += 1) { const s = score(a); if (s > bs) { bs = s; best = a; } }
+  const b0 = best; for (let a = b0 - 1; a <= b0 + 1.001; a += 0.1) { const s = score(a); if (s > bs) { bs = s; best = a; } }
   // solo si el ángulo da un perfil claramente mejor que sin girar
   if (Math.abs(best) < 0.35 || bs < score(0) * 1.08) return { canvas, angle: 0 };
   const a = best * Math.PI / 180, cs = Math.abs(Math.cos(a)), sn = Math.abs(Math.sin(a));
@@ -614,11 +807,15 @@ function scanClean(canvas, mode) {
   const q = Math.max(1, Math.round(Math.min(w, h) / 500)), wq = Math.ceil(w / q), hq = Math.ceil(h / q);
   let fCount = 0; const fq = new Float32Array(wq * hq);
   for (let i = 0; i < n; i++) if (finger[i]) { fCount++; fq[(((i / w) | 0) / q | 0) * wq + ((i % w) / q | 0)] = 1; }
-  const fGrown = new Uint8Array(n);
-  if (fCount) { const fqG = sMorph(fq, wq, hq, Math.max(2, Math.round(w / 45 / q)), true); for (let y = 0; y < h; y++) { const row = ((y / q) | 0) * wq; for (let x = 0; x < w; x++) fGrown[y * w + x] = fqG[row + ((x / q) | 0)] ? 1 : 0; } }
+  // Dedo: núcleo (se borra), franja cercana (se borra: sombra del dedo) y franja amplia (solo se borra lo que no es tinta)
+  const fGrown = new Uint8Array(n), fBand = new Uint8Array(n);
+  if (fCount) {
+    const rc = Math.max(1, Math.round(w / 250 / q)), fqC = sMorph(fq, wq, hq, rc, true), fqB = sMorph(fq, wq, hq, Math.max(2, Math.round(w / 45 / q)), true);
+    for (let y = 0; y < h; y++) { const row = ((y / q) | 0) * wq; for (let x = 0; x < w; x++) { const j = row + ((x / q) | 0); fGrown[y * w + x] = fqC[j] ? 1 : 0; fBand[y * w + x] = fqB[j] ? 1 : 0; } }
+  }
   // 1) Fondo (luz del papel) a baja resolución
   const gq = new Float32Array(wq * hq);
-  for (let y = 0; y < hq; y++) for (let x = 0; x < wq; x++) { let t = 0, c = 0; for (let yy = y * q; yy < Math.min(h, y * q + q); yy++) for (let xx = x * q; xx < Math.min(w, x * q + q); xx++) { const i = yy * w + xx; t += fGrown[i] ? 245 : g[i]; c++; } gq[y * wq + x] = t / c; }
+  for (let y = 0; y < hq; y++) for (let x = 0; x < wq; x++) { let t = 0, c = 0; for (let yy = y * q; yy < Math.min(h, y * q + q); yy++) for (let xx = x * q; xx < Math.min(w, x * q + q); xx++) { const i = yy * w + xx; t += fBand[i] ? 245 : g[i]; c++; } gq[y * wq + x] = t / c; }
   const rT = Math.max(3, Math.round(wq * 0.02)); // más ancho que cualquier trazo de letra
   const closed = sMorph(sMorph(gq, wq, hq, rT, true), wq, hq, Math.round(rT * 0.7), false);
   const bgq = sBoxBlur(closed, wq, hq, Math.max(2, Math.round(rT * 0.8)));
@@ -647,7 +844,8 @@ function scanClean(canvas, mode) {
   const creaseG = sMorph(Float32Array.from(crease), w, h, 1, true);
   const o = d;
   for (let i = 0; i < n; i++) {
-    const white = fGrown[i] || creaseG[i];
+    // junto al dedo solo sobrevive la tinta clara y oscura del texto (no la sombra ni la piel)
+    const white = fGrown[i] || creaseG[i] || (fBand[i] && (skin[i] || sharp[i] > B + (Wat(i) - B) * 0.45));
     const L = white ? 255 : Math.round(lv(sharp[i], Wat(i)) * 255);
     if (mode === 'color' && L < 255) {
       // Color: la luminosidad es la misma del modo mejorado; se conserva el tono original (sellos, logos, tinta azul)
@@ -858,7 +1056,8 @@ function scanTick() {
   const vw = v.videoWidth, vh = v.videoHeight, r = v.getBoundingClientRect();
   ov.width = r.width * devicePixelRatio; ov.height = r.height * devicePixelRatio;
   const k = Math.min(r.width / vw, r.height / vh), ox = (r.width - vw * k) / 2, oy = (r.height - vh * k) / 2;
-  const det = scanDetect(v, vw, vh);
+  // Primero el método por texto (versión liviana); si no hay texto visible, el clásico por contraste
+  const det = sDetectWS(v, vw, vh, 320) || scanDetect(v, vw, vh);
   const c = ov.getContext('2d'); c.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); c.clearRect(0, 0, r.width, r.height);
   const good = det && det.score > 0.82 && det.cover > 0.12;
   if (det && det.score > 0.6) {
@@ -907,10 +1106,8 @@ async function scanShot(quad) {
 // Pantalla para ajustar el recorte: esquinas (círculos grandes) y curvatura de cada borde (círculos pequeños del medio)
 function scanEditor(canvas, quad, curve, userCurve) {
   SC.src = canvas;
-  if (!curve) { // detección fina sobre la foto tomada: esquinas más precisas y bordes curvos
-    const det = scanDetect(canvas, canvas.width, canvas.height, 900);
-    if (det && det.score > 0.6) { const rf = scanRefine(det); quad = rf.quad; curve = rf.curve; }
-  }
+  SC.det = null; SC.autoQuad = null;
+  if (!curve) { const a = scanAutoDetect(canvas); if (a.quad) { quad = a.quad; curve = a.curve; SC.det = a.det; SC.autoQuad = a.quad.map(p => p.slice()); } } // detección fina sobre la foto tomada
   SC.quad = (quad || scanFullQuad(canvas.width, canvas.height)).map(p => p.slice());
   SC.curve = curve ? JSON.parse(JSON.stringify(curve)) : curveZero(); SC.userCurve = !!userCurve;
   SC.el.innerHTML = `<div class="sc-top"><button class="sc-btn" data-sc="retake" aria-label="Repetir">${ic('left')}</button><div class="sc-title">Ajusta el recorte</div><button class="sc-btn" data-sc="rotate" aria-label="Rotar">${ic('repeat')}</button></div>
@@ -976,6 +1173,58 @@ function drawEditor() {
     c.lineWidth = big ? 3 : 2; c.strokeStyle = big ? '#fff' : 'rgba(0,0,0,.45)'; c.stroke();
   });
 }
+// Detección automática sobre una foto (la misma que usa el editor de recorte)
+function scanAutoDetect(canvas) {
+  const det = scanDetect(canvas, canvas.width, canvas.height, 900);
+  if (det && det.score > 0.6) { const rf = scanRefine(det); return { quad: rf.quad, curve: rf.curve, det }; }
+  return { quad: null, curve: null, det };
+}
+// Máscara del papel (de la detección) llevada al recorte: 1 = papel, 0 = dedos, mano o fondo
+function sWarpMask(mask, quad, curve, W, H) {
+  const { m, w, h, k } = mask, Hm = sHomography(UNIT, quad), out = new Uint8Array(W * H);
+  const md = sMorph(Float32Array.from(m), w, h, 1, true); // un píxel de holgura: no recortar letras del borde
+  const ct = new Float32Array(W), cb = new Float32Array(W), cl = new Float32Array(H), cr = new Float32Array(H);
+  for (let u = 0; u < W; u++) { const s = (u + 0.5) / W; ct[u] = curveSample(curve.t, s); cb[u] = curveSample(curve.b, s); }
+  for (let v = 0; v < H; v++) { const s = (v + 0.5) / H; cl[v] = curveSample(curve.l, s); cr[v] = curveSample(curve.r, s); }
+  for (let v = 0; v < H; v++) {
+    const vv = (v + 0.5) / H;
+    for (let u = 0; u < W; u++) {
+      const uu = (u + 0.5) / W, px = uu + (1 - uu) * cl[v] + uu * cr[v], py = vv + (1 - vv) * ct[u] + vv * cb[u];
+      const z = Hm[6] * px + Hm[7] * py + 1, x = Math.round((Hm[0] * px + Hm[1] * py + Hm[2]) / z * k - 0.5), y = Math.round((Hm[3] * px + Hm[4] * py + Hm[5]) / z * k - 0.5);
+      out[v * W + u] = x >= 0 && y >= 0 && x < w && y < h ? (md[y * w + x] ? 1 : 0) : 0;
+    }
+  }
+  return out;
+}
+// Procesamiento completo de "Usar": recorte con perspectiva/curva, enderezado y limpieza.
+// det: detección automática; si el recorte no se movió a mano, todo lo que no es papel (dedos, mano, fondo) queda en blanco.
+function scanProcess(src, quad, curve, userCurve, mode, det) {
+  quad = quad || scanFullQuad(src.width, src.height); curve = curve || curveZero();
+  const side = scanTargetSide(src, quad);
+  let warped = scanWarp(src, quad, side, curve), used = curve;
+  // Si la curva vino de la detección (no la tocaste), se verifica que de verdad mejore: con bordes mal medidos
+  // la curva podría torcer el texto en "S". Se queda la versión con renglones más nítidos.
+  if (!userCurve && ['t', 'r', 'b', 'l'].some(k => curve[k].some(v => Math.abs(v) > 0.004))) {
+    const flat = scanWarp(src, quad, side, curveZero());
+    const sh = cv => { const s = sInkSmall(cv, 300); return sRowSharpness(s.ink, s.Wd, s.Hd, null); };
+    if (sh(warped) < sh(flat) * 1.04) { warped = flat; used = curveZero(); } // la curva solo se usa si mejora claramente
+  }
+  if (det && det.view === 'ws' && det.mask) {
+    const W = warped.width, H = warped.height, pm = sWarpMask(det.mask, quad, used, W, H);
+    let keep = 0; for (let i = 0; i < pm.length; i++) keep += pm[i];
+    if (keep > pm.length * 0.6) { // con una máscara razonable: lo que no es papel se pinta del color del papel
+      const ctx = warped.getContext('2d', { willReadFrequently: true }), id = ctx.getImageData(0, 0, W, H), dd = id.data, ch = [[], [], []];
+      for (let i = 0; i < W * H; i += 53) if (pm[i]) for (let c = 0; c < 3; c++) ch[c].push(dd[i * 4 + c]);
+      const paper = ch.map(v => { v.sort((x, y) => x - y); return v[Math.floor(v.length * 0.85)] || 245; });
+      for (let i = 0; i < W * H; i++) if (!pm[i]) { dd[i * 4] = paper[0]; dd[i * 4 + 1] = paper[1]; dd[i * 4 + 2] = paper[2]; }
+      ctx.putImageData(id, 0, 0);
+    }
+  }
+  const level = scanDeskew(warped).canvas; // gira el texto si viene inclinado
+  let straight = level; for (let i = 0; i < 4; i++) { const nx = scanStraighten(straight); if (nx === straight) break; straight = nx; } // endereza renglones (hasta 4 pasadas, solo si mejora)
+  const res = scanClean(straight, mode || 'clean'); res.canvas = scanTrim(res.canvas);
+  return res;
+}
 // Lado mayor del resultado: ~5 millones de píxeles como máximo, sin inventar más resolución de la que tiene la foto
 function scanTargetSide(src, quad) {
   const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
@@ -987,18 +1236,8 @@ async function scanFinish() {
   const btn = $('.sc-done', SC.el); if (btn) { btn.disabled = true; btn.innerHTML = 'Procesando…'; }
   await new Promise(r => setTimeout(r, 30));
   try {
-    const side = scanTargetSide(SC.src, SC.quad);
-    let warped = scanWarp(SC.src, SC.quad, side, SC.curve);
-    // Si la curva vino de la detección (no la tocaste), se verifica que de verdad mejore: con bordes mal medidos
-    // la curva podría torcer el texto en "S". Se queda la versión con renglones más nítidos.
-    if (!SC.userCurve && ['t', 'r', 'b', 'l'].some(k => SC.curve[k].some(v => Math.abs(v) > 0.004))) {
-      const flat = scanWarp(SC.src, SC.quad, side, curveZero());
-      const sh = cv => { const s = sInkSmall(cv, 300); return sRowSharpness(s.ink, s.Wd, s.Hd, null); };
-      if (sh(flat) > sh(warped) * 1.02) warped = flat;
-    }
-    const level = scanDeskew(warped).canvas;                  // gira el texto si viene inclinado
-    let straight = level; for (let i = 0; i < 4; i++) { const nx = scanStraighten(straight); if (nx === straight) break; straight = nx; } // endereza renglones (hasta 4 pasadas, solo si mejora)
-    const res = scanClean(straight, SC.mode); res.canvas = scanTrim(res.canvas);
+    const moved = !SC.autoQuad || SC.quad.some((p, i) => Math.hypot(p[0] - SC.autoQuad[i][0], p[1] - SC.autoQuad[i][1]) > 2);
+    const res = scanProcess(SC.src, SC.quad, SC.curve, SC.userCurve, SC.mode, moved || SC.userCurve ? null : SC.det);
     const done = SC.onDone, src = SC.src, quad = SC.quad.map(p => p.slice()), curve = JSON.parse(JSON.stringify(SC.curve)), mode = SC.mode, userCurve = SC.userCurve;
     closeScanner();
     if (done) await done({ canvas: res.canvas, src, quad, curve, userCurve, mode, fingers: res.fingers });
@@ -1011,7 +1250,7 @@ document.addEventListener('click', e => {
   if (a === 'auto') { SC.auto = !SC.auto; S.settings.scanAuto = SC.auto; save(); b.setAttribute('aria-pressed', String(SC.auto)); SC.stable = 0; const h = $('.sc-hint', SC.el); if (h) h.textContent = 'Pon la tirilla estirada sobre una superficie oscura. ' + (SC.auto ? 'Se toma sola cuando la detecta quieta.' : 'Toca el botón para tomarla.'); }
   if (a === 'shot') scanShot(SC.last);
   if (a === 'retake') { const cb = SC.onDone; openScanner(cb); }
-  if (a === 'rotate') { const r = scanRotate(SC.src, SC.quad, SC.curve); SC.src = r.canvas; SC.quad = r.quad; SC.curve = r.curve; drawEditor(); }
+  if (a === 'rotate') { SC.det = null; SC.autoQuad = null; const r = scanRotate(SC.src, SC.quad, SC.curve); SC.src = r.canvas; SC.quad = r.quad; SC.curve = r.curve; drawEditor(); }
   if (a === 'mode') { SC.mode = b.dataset.v; S.settings.scanMode = SC.mode; save(); $$('[data-sc="mode"]', SC.el).forEach(x => x.setAttribute('aria-pressed', String(x.dataset.v === SC.mode))); }
   if (a === 'done') scanFinish();
 });

@@ -190,6 +190,54 @@ test('lectura de factura: supermercado con IVA y domicilio, sin inventar', () =>
   assert.equal(C.parseReceiptText('foto borrosa sin numeros').total, null);
 });
 
+test('lectura de tirilla de almacén: ítems en dos líneas, dígito mal leído, IVA corrido y tienda', () => {
+  // Texto como lo entrega el lector: "79,940" es un 29.940 mal leído y el IVA quedó medio renglón arriba
+  const txt = `PERMODA LTDA.
+NIT: 860.516.806 - 5
+TIENDA KOAJ CALLE 12 CENTRO
+KOAJ
+Calle 7 # 12B-58 Piso 1
+1_FAC ELECTRONICA VENTA S17E-56012
+Consecutivo:S17E-56012
+Fecha: 30/08/26 Hora: 13:40:57
+CODIGO DESCRIPCION
+COLOR TALLA UM CANT PRECIO DCTO TOTAL
+105236761012 SHORT KOAJ MAUS 27963 4/25
+948 08 94 1 29.940 79,940
+105255761120 MEDIAS KOAJ TOBILLERA 29145
+910 9-11 94 1 4.740 4.70
+291318 BOLSA PAPEL
+999 S 94 1 700 700
+T.Unid. VALOR DTO.LIN TOTAL
+3 35.380 0 35.380
+33050
+Vta.Subtotal
+5650
+Iva 19%
+TOTAL : 35.380
+TEF CRED 35.380
+CAMBIO 0
+AUTORRETENEDORES DE RENTA RES.007241 DEL`;
+  const r = C.parseReceiptText(txt);
+  assert.equal(r.total, 35380);
+  assert.equal(r.merchant, 'KOAJ');
+  assert.equal(r.date, '2026-08-30');
+  assert.deepEqual(r.items.map(i => [i.name, i.amount]), [['SHORT KOAJ MAUS', 29940], ['MEDIAS KOAJ TOBILLERA', 4740], ['BOLSA PAPEL', 700]]);
+  assert.equal(r.tax, 5650);              // 35.380 − 35.380/1,19
+  assert.equal(r.discount, null);         // "S17E-56012" es un código, no un descuento
+});
+test('lectura: total con dos puntos, marca completa y dos lecturas que se completan', () => {
+  const a = C.parseReceiptText('ARTURO CALLE S.A.S.\nTIENDA ARTURO CALLE CALLE 45 CENTRO\nARTURO CALLE\nCAMISA OXFORD 1 89.900\nTOTAL :    89.900\nTEF DEB 89.900');
+  assert.equal(a.total, 89900); assert.equal(a.merchant, 'ARTURO CALLE');
+  // la primera lectura perdió el IVA; la segunda lo tiene y cuadra con el total
+  const r1 = C.parseReceiptText('CAMISA OXFORD 89.900\nTOTAL : 89.900'), r2 = C.parseReceiptText('CAMISA OXFORD 89.900\nIva 19% 14.354\nTOTAL : 89.900');
+  const m = C.mergeReceiptReads(r1, r2);
+  assert.equal(m.total, 89900); assert.equal(m.tax, 14354);
+  // renglones rearmados con la posición de las palabras
+  const w = (t, x, y) => ({ text: t, bbox: { x0: x, x1: x + t.length * 10, y0: y, y1: y + 20 } });
+  assert.deepEqual(C.receiptLinesFromWords([w('Iva', 10, 100), w('19%', 60, 101), w('6280', 300, 92)]), ['Iva 19% 6280']);
+});
+
 test('lista de deseos: fondo mensual, plan por prioridad y fecha en que alcanza', () => {
   const fund = { start: '2026-09', history: [{ from: '2026-09', amount: 300000 }], adjustments: [{ amount: 200000 }], horizon: '2026-12-31' };
   const wishes = [

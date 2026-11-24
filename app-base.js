@@ -1,7 +1,7 @@
 /* WalletWeb — base: estado, almacenamiento local, utilidades de interfaz, bloqueo. */
 'use strict';
 const C = window.WWCore;
-const APP_VERSION = '1.31.0';
+const APP_VERSION = '1.32.0';
 const IN_FRAME = (() => { try { return window.self !== window.top; } catch (e) { return true; } })();
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));

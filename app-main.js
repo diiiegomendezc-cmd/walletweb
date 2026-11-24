@@ -35,7 +35,7 @@ const ACT = {
     t.status = 'confirmed'; t.updatedAt = new Date().toISOString(); audit('transaction.confirmed', 'transaction', t.id, `Confirmado: ${txTitle(t)} ${C.formatMoney(t.amount)}`); save(); await closeSheet(true); render(); toast('Movimiento confirmado'); },
   txSave: () => txSave(),
   dtype: el => { D.type = el.dataset.v; D.categoryId = ''; D.subcategoryId = ''; D.loanMode = false; D.loanId = ''; if (D.type !== 'expense') D.splitOn = false; rerenderTx(); },
-  dset: el => { const k = el.dataset.k; D[k] = el.dataset.v; if (k === 'type' && el.dataset.v !== 'income') { D.loanMode = false; D.loanId = ''; } if (k === 'accountId' && D.toAccountId === D.accountId) D.toAccountId = ''; rerenderTx(); },
+  dset: el => { const k = el.dataset.k; D[k] = el.dataset.v; if (D.ocrFilled) delete D.ocrFilled[k]; if (k === 'type' && el.dataset.v !== 'income') { D.loanMode = false; D.loanId = ''; } if (k === 'accountId' && D.toAccountId === D.accountId) D.toAccountId = ''; rerenderTx(); },
   dcat: el => { const v = el.dataset.v; D.loanMode = false; D.loanId = ''; D.categoryId = D.categoryId === v ? '' : v; D.subcategoryId = ''; const c = catById(D.categoryId); if (c?.defaultNature) D.nature = c.defaultNature; rerenderTx(); },
   dmore: () => { D.more = !D.more; rerenderTx(); },
   itemAdd: () => { D.items.push({ name: '', qty: '', unit: '' }); rerenderTx(); setTimeout(() => $(`[data-it="${D.items.length - 1}"][data-itk="name"]`)?.focus(), 30); },

@@ -25,6 +25,7 @@ Antes de cambiar algo grande, lee `PROJECT_STATUS.md` (decisiones y límites) y 
 | `sw.js` | Service worker (caché del shell). **Subir `VERSION` en cada entrega** |
 | `vendor/` | Leaflet y Tesseract.js (con `spa.traineddata.gz`) locales |
 | `tests/core.test.cjs` | Pruebas del núcleo |
+| `tools/scanlab/` | Laboratorio del escáner (solo desarrollo): generador de fotos sintéticas, ejecución con el mismo código de la app y evaluador. Ver su README. Nunca subir fotos de facturas reales |
 
 ## Reglas
 - Interfaz en español de Colombia; dinero en pesos como **enteros** (sin decimales), formato `$ 1.234.567`.
@@ -46,4 +47,4 @@ Antes de cambiar algo grande, lee `PROJECT_STATUS.md` (decisiones y límites) y 
   una cuenta "Fondo de ahorro" y transferencias, o (b) un fondo automático que al cierre del mes guarde el
   sobrante. Falta que elija qué cuenta como "sobrante": lo que queda del presupuesto Global (tope − gastado)
   o lo real (recibido − gastado).
-- El escáner se probó con fotos sintéticas; falta afinarlo con fotos reales del iPhone.
+- Escáner: con cada foto real que falle, pásala por `tools/scanlab/run_one.js` (sin subirla al repo) y vuelve a medir el conjunto sintético para no empeorar (meta > 90 %).

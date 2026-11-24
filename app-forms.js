@@ -59,7 +59,7 @@ function txFormBody() {
       <div class="amount-preview" id="amtPrev" aria-live="polite"></div>
       <div class="ops" aria-label="Operaciones">${[['+', '+'], ['-', '−'], ['*', '×'], ['/', '÷']].map(([o, l]) => `<button type="button" data-act="op" data-v="${o}" aria-label="Operador ${l}">${l}</button>`).join('')}<button type="button" data-act="pasteSheet" aria-label="Pegar texto de una notificación" style="width:auto;padding:0 12px;font-size:14px">${ic('paste', 'sm')}</button></div>
     </div>
-    <div class="field"><span class="lbl">Fecha</span><div style="display:flex;gap:8px;align-items:center"><button type="button" class="chip" data-act="dset" data-k="date" data-v="${today()}" aria-pressed="${d.date === today()}">Hoy</button><button type="button" class="chip" data-act="dset" data-k="date" data-v="${C.addDays(today(), -1)}" aria-pressed="${d.date === C.addDays(today(), -1)}">Ayer</button><input type="date" class="input" data-f="date" value="${esc(d.date)}" aria-label="Fecha" style="flex:1;min-width:0"></div></div>
+    <div class="field"><span class="lbl">Fecha</span><div style="display:flex;gap:8px;align-items:center"><button type="button" class="chip" data-act="dset" data-k="date" data-v="${today()}" aria-pressed="${d.date === today()}">Hoy</button><button type="button" class="chip" data-act="dset" data-k="date" data-v="${C.addDays(today(), -1)}" aria-pressed="${d.date === C.addDays(today(), -1)}">Ayer</button><input type="date" class="input${d.ocrFilled?.date ? ' ocr-filled' : ''}" data-f="date" value="${esc(d.date)}" aria-label="Fecha" style="flex:1;min-width:0"></div>${d.ocrFilled?.date ? '<p class="hint" style="margin:6px 4px 0">Fecha leída de la factura <span class="ocr-tag">foto</span></p>' : ''}</div>
     ${d.type === 'transfer'
       ? `<div class="grid2"><div class="field"><label for="accFrom">Desde</label><select id="accFrom" class="input" data-f="accountId" data-rerender>${accOpts(d.accountId, null)}</select></div><div class="field"><label for="accTo">Hacia</label><select id="accTo" class="input" data-f="toAccountId" data-rerender>${accOpts(d.toAccountId, d.accountId)}</select></div></div>${refField}<p class="hint" id="refHint" style="margin:-8px 4px 12px"></p>`
       : withCat ? '' : accBlock}
@@ -68,7 +68,7 @@ function txFormBody() {
       ${accBlock}
       ${d.type === 'income'
         ? `<div class="field"><label for="merch">Pagador o entidad</label><input id="merch" class="input" data-f="merchant" value="${esc(d.merchant)}" list="merchList" autocomplete="off" placeholder="Ej. Empresa"><datalist id="merchList">${merchants.map(m => `<option value="${esc(m)}">`).join('')}</datalist></div>`
-        : `<div class="field"><label for="merch">Tienda <span class="muted" style="font-weight:500">(opcional)</span></label><input id="merch" class="input" data-f="merchant" value="${esc(d.merchant)}" list="merchList" autocomplete="off" placeholder="Ej. Éxito Calle 80"><datalist id="merchList">${merchants.map(m => `<option value="${esc(m)}">`).join('')}</datalist></div>
+        : `<div class="field"><label for="merch">Tienda <span class="muted" style="font-weight:500">(opcional)</span>${d.ocrFilled?.merchant ? ' <span class="ocr-tag" title="Leído de la foto">foto</span>' : ''}</label><input id="merch" class="input${d.ocrFilled?.merchant ? ' ocr-filled' : ''}" data-f="merchant" value="${esc(d.merchant)}" list="merchList" autocomplete="off" placeholder="Ej. Éxito Calle 80"><datalist id="merchList">${merchants.map(m => `<option value="${esc(m)}">`).join('')}</datalist></div>
       <div class="field"><label for="mapsIn">Link <span class="muted" style="font-weight:500">(opcional · Google Maps o página del artículo)</span></label>
         <input id="mapsIn" class="input" data-f="mapsUrl" value="${esc(d.mapsUrl)}" placeholder="https://…" inputmode="url" autocomplete="off" spellcheck="false">
         <div class="link-tools">
@@ -209,7 +209,7 @@ function ocrStatusHTML() {
   if (o.state === 'running') return `<div class="small" style="font-weight:600">${esc(o.step || 'Leyendo la factura…')}</div><div style="margin-top:8px">${progress(Math.round((o.progress || 0) * 100))}</div>`;
   if (o.state === 'error') return `<div class="small neg" style="font-weight:600">${esc(o.msg)}</div>`;
   const r = o.r, f = v => C.formatMoney(v);
-  const bits = [r.total ? 'Total ' + f(r.total) : '', r.tax ? 'Impuestos ' + f(r.tax) : '', r.tip ? 'Propina ' + f(r.tip) : '', r.discount ? 'Descuento ' + f(r.discount) : '', r.shipping ? 'Envío ' + f(r.shipping) : '', r.items.length ? r.items.length + ' producto(s)' : ''].filter(Boolean);
+  const bits = [r.merchant ? niceName(r.merchant) : '', r.date ? fdShort(r.date) : '', r.total ? 'Total ' + f(r.total) : '', r.tax ? 'Impuestos ' + f(r.tax) : '', r.tip ? 'Propina ' + f(r.tip) : '', r.discount ? 'Descuento ' + f(r.discount) : '', r.shipping ? 'Envío ' + f(r.shipping) : '', r.items.length ? r.items.length + ' producto(s)' : ''].filter(Boolean);
   if (!bits.length) return `<div class="small" style="font-weight:600">No pude leer datos claros en la foto.</div><div class="small muted">Prueba con más luz y la factura derecha, o escríbelos a mano.</div>`;
   const amt = C.evalAmount(D.amountText), sug = [];
   if (r.total && amt && amt !== r.total) sug.push(`<button type="button" class="chip" data-act="ocrUse" data-k="amount">Usar total ${esc(f(r.total))}</button>`);
@@ -218,6 +218,8 @@ function ocrStatusHTML() {
   return `<div class="small" style="font-weight:650">${o.source === 'texto' ? 'Leído del texto' : 'Leído de la foto'}</div><div class="small muted" style="margin-top:2px">${esc(bits.join(' · '))}</div>
     ${sug.length ? `<div class="chips wrap" style="margin-top:8px">${sug.join('')}</div>` : ''}<div class="tiny muted" style="margin-top:6px">Los campos marcados “de la foto” se pueden corregir.</div>`;
 }
+// "ARTURO CALLE" → "Arturo Calle"; siglas cortas (D1, KOAJ) se dejan tal cual
+function niceName(s) { s = String(s || '').trim(); return s.split(/\s+/).map(w => w.length <= 4 && /^[A-Z0-9&.]+$/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ').slice(0, 60); }
 function receiptItems(items) { return items.map(i => ({ name: i.name.charAt(0) + i.name.slice(1).toLowerCase(), qty: String(i.qty || 1), unit: Math.round(i.amount / (i.qty || 1)).toLocaleString('es-CO') })); }
 function itemsText(items) { return items.map(i => `${i.qty > 1 ? i.qty + ' × ' : ''}${i.name.charAt(0) + i.name.slice(1).toLowerCase()} — ${C.formatMoney(i.amount)}`).join('\n'); }
 // Llena solo los campos vacíos; lo que ya escribiste no se toca
@@ -227,6 +229,8 @@ function applyReceiptData(r, source) {
   for (const k of ['tax', 'tip', 'discount', 'shipping']) if (r[k] && !String(D[k] || '').trim()) { D[k] = fmt(r[k]); D.ocrFilled[k] = true; if (!D.rows.includes(k)) D.rows = EXTRA_ROWS.map(x => x[0]).filter(x => D.rows.includes(x) || x === k); }
   if (r.total && !C.evalAmount(D.amountText)) { D.amountText = fmt(r.total); D.ocrFilled.amount = true; }
   if (r.items.length && !D.items.some(it => String(it.name).trim())) { D.items = receiptItems(r.items); D.ocrFilled.items = true; }
+  if (r.merchant && !String(D.merchant || '').trim() && D.type === 'expense') { D.merchant = niceName(r.merchant); D.ocrFilled.merchant = true; }
+  if (r.date && D.date === today() && !D.id && r.date <= today() && C.diffDays(r.date, today()) <= 400) { D.date = r.date; D.ocrFilled.date = true; }
   D.ocr = { state: 'done', r, source };
   D.more = true;
 }
@@ -279,7 +283,19 @@ async function runOcr(src) {
     const w = await getOcrWorker();
     const { data } = await w.recognize(canvas, {}, { text: true, blocks: true });
     if (D !== me) return;
-    applyReceiptData(C.parseReceiptText(data.text), 'foto');
+    let r = C.parseReceiptText(data.text);
+    const sumOk = x => x.total && x.items.length && Math.abs(x.items.reduce((s, i) => s + i.amount, 0) + (x.tip || 0) + (x.shipping || 0) - (x.discount || 0) - x.total) <= 1;
+    if (!r.total || !r.tax || !sumOk(r) || !r.date || !r.merchant) {
+      // Segunda lectura palabra por palabra: arregla montos impresos un poco más arriba o abajo que su etiqueta
+      me.ocr.step = 'Revisando los datos…'; me.ocr.progress = 0; paintOcr();
+      try {
+        await w.setParameters({ tessedit_pageseg_mode: '11' });
+        const d2 = (await w.recognize(canvas, {}, { text: true, blocks: true })).data;
+        r = C.mergeReceiptReads(r, C.parseReceiptText(C.receiptLinesFromWords(ocrWords(d2)).join('\n')));
+      } finally { await w.setParameters({ tessedit_pageseg_mode: '6' }); }
+      if (D !== me) return;
+    }
+    applyReceiptData(r, 'foto');
     if (me._scanJpeg) { // PDF con texto invisible encima de la imagen: se puede buscar y copiar
       const words = ocrWords(data);
       if (words.length) { const pdf = await buildReceiptPdf(me._scanJpeg, me._scanSize[0], me._scanSize[1], words); me.receiptBlob = pdf; me.receiptMeta.size = pdf.size; me._pdfWords = words.length; }
