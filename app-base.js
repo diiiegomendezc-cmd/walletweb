@@ -1,7 +1,7 @@
 /* WalletWeb — base: estado, almacenamiento local, utilidades de interfaz, bloqueo. */
 'use strict';
 const C = window.WWCore;
-const APP_VERSION = '1.32.0';
+const APP_VERSION = '1.33.0';
 const IN_FRAME = (() => { try { return window.self !== window.top; } catch (e) { return true; } })();
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));
@@ -106,12 +106,12 @@ function defaultWishFund() {
 }
 function defaultState() {
   return {
-    schema: 6, createdAt: new Date().toISOString(), demo: false,
+    schema: 7, createdAt: new Date().toISOString(), demo: false,
     settings: { theme: 'auto', lockMinutes: 1, lockOnHide: true, privacy: false, budgetMode: 'installment', warnPct: 80, pin: null, passkey: null,
       pinFails: 0, lockUntil: 0, holidayEx: { extraHolidays: [], workdays: [] }, lastBackupAt: null, onboarded: false, notifDetail: 'private',
-      glass: { transparency: 65, blur: 3, wallpaper: 'waves', refract: 70 }, scanAuto: true, scanMode: 'clean', tabs: DEFAULT_TABS.slice(), homeCharts: {} },
+      glass: { transparency: 65, blur: 3, wallpaper: 'waves', refract: 70 }, scanAuto: true, scanMode: 'clean', tabs: DEFAULT_TABS.slice(), homeCharts: {}, drive: null, driveAuto: true },
     institutions: DEFAULT_INST.slice(), accounts: [], categories: defaultCategories(), people: [], transactions: [], budgets: [], goals: [], wishes: [], wishFund: defaultWishFund(),
-    loans: [], rules: [], expected: [], audit: [], charts: [], draft: null
+    loans: [], rules: [], expected: [], audit: [], charts: [], driveFiles: {}, draft: null
   };
 }
 
@@ -274,6 +274,8 @@ const ICONS = {
   tag: '<path d="M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9z"/><circle cx="8" cy="8" r="1.5"/>',
   shield: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
   download: '<path d="M12 4v12M6 10l6 6 6-6M4 20h16"/>', upload: '<path d="M12 20V8M6 14l6-6 6 6M4 4h16"/>',
+  cloud: '<path d="M7.5 18H7a4 4 0 0 1-.6-7.96A6 6 0 0 1 17.7 9.1 4.5 4.5 0 0 1 17 18h-.5"/><path d="M12 20v-8M9 15l3-3 3 3"/>',
+  folder: '<path d="M3 7.5A1.5 1.5 0 0 1 4.5 6H9l2 2h8.5A1.5 1.5 0 0 1 21 9.5v8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/>',
   cal: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
   history: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',

@@ -687,6 +687,226 @@
     return { hash: b64(bits), salt: b64(salt) };
   }
 
+  /* ---------------- Google Drive: carpeta y nombre de cada comprobante ----------------
+     WalletWeb / Año / "MM Mes" / Movimiento / Categoría / "AAAAMMDD Persona Tienda.ext"
+     (el número del mes va adelante para que Drive los ordene en orden de calendario) */
+  const DRIVE_MONTHS = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+  const DRIVE_KIND = { expense: ['Gasto'], income: ['Ingreso'], transfer: ['Transferencia'], adjust: ['Ajuste'], loan_out: ['Préstamo', 'Entregados'], loan_in: ['Préstamo', 'Recibidos'],
+    repay_in: ['Préstamo', 'Abonos recibidos'], repay_out: ['Préstamo', 'Abonos pagados'], collect: ['Ingreso', 'Cobros de gastos compartidos'] };
+  // Quita lo que Drive o los sistemas de archivos no aceptan en un nombre (/ \ : * ? " < > |) y espacios repetidos
+  function driveSafe(s, max = 80) {
+    return String(s ?? '').normalize('NFC').replace(/[\\/:*?"<>|\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max).trim();
+  }
+  function driveExt(mime, name) {
+    const m = String(mime || '').toLowerCase();
+    if (m.includes('pdf')) return '.pdf';
+    if (m.includes('png')) return '.png';
+    if (m.includes('heic') || m.includes('heif')) return '.heic';
+    if (m.includes('webp')) return '.webp';
+    if (m.includes('jpeg') || m.includes('jpg')) return '.jpg';
+    const x = /\.([a-z0-9]{2,5})$/i.exec(String(name || ''));
+    return x ? '.' + x[1].toLowerCase() : '';
+  }
+  // o = { root, date, type, category, sub, people: [nombres], merchant, mime, fileName, fallback }
+  function driveTarget(o) {
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(o.date || '') ? o.date : todayISO();
+    const m = Number(date.slice(5, 7));
+    const kind = DRIVE_KIND[o.type] || ['Otros'];
+    const path = [driveSafe(o.root, 60) || 'WalletWeb', date.slice(0, 4), String(m).padStart(2, '0') + ' ' + DRIVE_MONTHS[m - 1], kind[0]];
+    if (kind[1]) path.push(kind[1]);
+    else if (o.type === 'expense' || o.type === 'income') path.push(driveSafe(o.category) || 'Sin categoría');
+    const names = (o.people || []).map(p => driveSafe(p, 40)).filter(Boolean);
+    const who = names.length > 3 ? names.slice(0, 2).join(', ') + ' y ' + (names.length - 2) + ' más'
+      : names.length > 1 ? names.slice(0, -1).join(', ') + ' y ' + names[names.length - 1] : (names[0] || '');
+    const d = date.replace(/-/g, '');
+    let base = [d, who, driveSafe(o.merchant, 60)].filter(Boolean).join(' ');
+    if (base === d) base += ' ' + (driveSafe(o.sub, 40) || (o.type === 'expense' ? 'Factura' : driveSafe(o.fallback, 40) || 'Comprobante'));
+    const name = base.slice(0, 120).trim() + driveExt(o.mime, o.fileName);
+    return { path, name, key: path.join('/') + '/' + name };
+  }
+  /* Programa que el usuario pega en Google Apps Script (en su propia cuenta) y publica como aplicación web.
+     Recibe los comprobantes de la app y solo toca archivos que él mismo creó dentro de la carpeta WalletWeb:
+     cada archivo lleva en su descripción "WalletWeb ref:<id del movimiento>" y cada carpeta suya una marca. */
+  const DRIVE_SCRIPT_VERSION = 1;
+  const DRIVE_GS = String.raw`/**
+ * WalletWeb Drive (versión 1)
+ * Recibe las facturas y soportes que envía tu app WalletWeb y los guarda ordenados en tu Google Drive:
+ *   WalletWeb / Año / Mes / Gasto, Ingreso o Transferencia / Categoría / AAAAMMDD Persona Tienda.pdf
+ * Solo crea, renombra, mueve o manda a la papelera archivos que él mismo creó dentro de la carpeta WalletWeb.
+ * La CLAVE es secreta y es la misma que tiene tu app: no la cambies ni compartas este código.
+ */
+var CLAVE = '__CLAVE__';
+var VERSION = 1;
+var MARCA_CARPETA = 'Carpeta creada por WalletWeb';
+var TIPOS = ['application/pdf', 'image/jpeg', 'image/png', 'image/heic', 'image/heif', 'image/webp'];
+
+function doGet() {
+  return ContentService.createTextOutput('WalletWeb Drive está funcionando. Copia la dirección de esta página (termina en /exec) y pégala en la app: Ajustes > Facturas en Google Drive.');
+}
+
+function doPost(e) {
+  var candado = LockService.getScriptLock(), tengo = false;
+  try {
+    var p = JSON.parse(e && e.postData ? e.postData.contents : '{}');
+    if (!p || p.clave !== CLAVE) return salida({ ok: false, error: 'clave' });
+    tengo = candado.tryLock(30000);
+    if (!tengo) return salida({ ok: false, error: 'ocupado' });
+    if (p.accion === 'probar') return salida({ ok: true, version: VERSION, cuenta: cuenta(), carpeta: raiz(p.raiz).getUrl() });
+    if (p.accion === 'subir') return salida(subir(p));
+    if (p.accion === 'papelera') return salida(papelera(p));
+    return salida({ ok: false, error: 'accion' });
+  } catch (err) {
+    return salida({ ok: false, error: 'script', mensaje: String(err && err.message ? err.message : err).slice(0, 300) });
+  } finally {
+    if (tengo) candado.releaseLock();
+  }
+}
+
+function salida(o) {
+  return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function cuenta() {
+  try { return Session.getEffectiveUser().getEmail() || ''; } catch (e) { return ''; }
+}
+
+function limpio(s, max) {
+  return String(s || '').replace(/[\\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max || 120);
+}
+
+// Carpeta principal: "WalletWeb" (o "WalletWeb - Perfil"). Se recuerda aunque la muevas dentro de tu Drive.
+function raiz(nombre) {
+  nombre = limpio(nombre || 'WalletWeb', 80);
+  if (!/^WalletWeb( - .+)?$/.test(nombre)) nombre = 'WalletWeb';
+  var props = PropertiesService.getScriptProperties(), k = 'raiz:' + nombre, id = props.getProperty(k);
+  if (id) {
+    try { var f = DriveApp.getFolderById(id); if (!f.isTrashed()) return f; } catch (e) {}
+  }
+  var c = hija(DriveApp.getRootFolder(), nombre);
+  props.setProperty(k, c.getId());
+  return c;
+}
+
+function carpeta(ruta) {
+  if (!ruta || !ruta.length || ruta.length > 8) throw new Error('Ruta no válida');
+  var c = raiz(ruta[0]);
+  for (var i = 1; i < ruta.length; i++) c = hija(c, limpio(ruta[i], 80) || 'Otros');
+  return c;
+}
+
+function hija(padre, nombre) {
+  var it = padre.getFoldersByName(nombre);
+  while (it.hasNext()) { var f = it.next(); if (!f.isTrashed()) return f; }
+  var nueva = padre.createFolder(nombre);
+  nueva.setDescription(MARCA_CARPETA);
+  return nueva;
+}
+
+function firma(ref) { return 'WalletWeb ref:' + ref + ' '; }
+
+// Solo devuelve archivos creados por WalletWeb para ese movimiento
+function buscar(id, ref) {
+  if (!id || !ref) return null;
+  var f;
+  try { f = DriveApp.getFileById(String(id)); } catch (e) { return null; }
+  return String(f.getDescription() || '').indexOf(firma(ref)) >= 0 ? f : null;
+}
+
+function padres(f) {
+  var out = [], it = f.getParents();
+  while (it.hasNext()) out.push(it.next());
+  return out;
+}
+
+function vivos(it) {
+  while (it.hasNext()) if (!it.next().isTrashed()) return true;
+  return false;
+}
+
+function ocupado(c, nombre, propio) {
+  var it = c.getFilesByName(nombre);
+  while (it.hasNext()) { var f = it.next(); if (!f.isTrashed() && f.getId() !== propio) return true; }
+  return false;
+}
+
+// "20261124 Laura Koaj.pdf" → si ya existe otro con ese nombre: "20261124 Laura Koaj (2).pdf"
+function libre(c, nombre, propio) {
+  var punto = nombre.lastIndexOf('.'), base = punto > 0 ? nombre.slice(0, punto) : nombre, ext = punto > 0 ? nombre.slice(punto) : '';
+  for (var k = 1; k < 100; k++) {
+    var n = k === 1 ? nombre : base + ' (' + k + ')' + ext;
+    if (!ocupado(c, n, propio)) return n;
+  }
+  return base + ' (' + new Date().getTime() + ')' + ext;
+}
+
+// Manda a la papelera las carpetas de WalletWeb que quedaron vacías (nunca la principal ni carpetas tuyas)
+function limpiar(c) {
+  for (var i = 0; i < 8 && c; i++) {
+    if (c.isTrashed() || String(c.getDescription() || '') !== MARCA_CARPETA || /^WalletWeb( - .+)?$/.test(c.getName())) return;
+    if (vivos(c.getFiles()) || vivos(c.getFolders())) return;
+    var ps = c.getParents(), padre = ps.hasNext() ? ps.next() : null;
+    c.setTrashed(true);
+    c = padre;
+  }
+}
+
+function respuesta(f) {
+  return { ok: true, id: f.getId(), url: f.getUrl(), nombre: f.getName(), version: VERSION };
+}
+
+function subir(p) {
+  var ref = String(p.ref || '');
+  if (!/^[\w-]{6,80}$/.test(ref)) return { ok: false, error: 'ref' };
+  var ver = String(p.ver || '').replace(/[^\w-]/g, '').slice(0, 60);
+  var destino = carpeta(p.ruta), nombre = limpio(p.nombre, 140) || 'Comprobante';
+  var desc = String(p.descripcion || '').slice(0, 1500) + '\n\n' + firma(ref) + 'v:' + ver;
+  var f = buscar(p.id, ref), antes;
+  if (!p.datos) { // mover, renombrar o sacar de la papelera
+    if (!f) return { ok: false, error: 'noexiste' };
+    antes = padres(f);
+    if (f.isTrashed()) f.setTrashed(false);
+    if (!antes.some(function (x) { return x.getId() === destino.getId(); })) f.moveTo(destino);
+    var n = libre(destino, nombre, f.getId());
+    if (f.getName() !== n) f.setName(n);
+    f.setDescription(desc);
+    antes.forEach(function (x) { if (x.getId() !== destino.getId()) limpiar(x); });
+    return respuesta(f);
+  }
+  // Reintento de una subida que sí llegó (se perdió la respuesta): no duplicar
+  var cache = CacheService.getScriptCache(), ck = 'w:' + ref + ':' + ver;
+  var previo = buscar(cache.get(ck), ref);
+  if (previo && !previo.isTrashed()) return respuesta(previo);
+  var it = destino.getFilesByName(nombre);
+  while (it.hasNext()) {
+    var x = it.next();
+    if (!x.isTrashed() && String(x.getDescription() || '').indexOf(firma(ref) + 'v:' + ver) >= 0) { cache.put(ck, x.getId(), 21600); return respuesta(x); }
+  }
+  antes = [];
+  if (f) { antes = padres(f); if (!f.isTrashed()) f.setTrashed(true); } // la versión anterior va a la papelera
+  var tipo = TIPOS.indexOf(p.tipo) >= 0 ? p.tipo : 'application/octet-stream';
+  var nuevo = destino.createFile(Utilities.newBlob(Utilities.base64Decode(p.datos), tipo, libre(destino, nombre, null)));
+  nuevo.setDescription(desc);
+  cache.put(ck, nuevo.getId(), 21600);
+  antes.forEach(function (x) { if (x.getId() !== destino.getId()) limpiar(x); });
+  return respuesta(nuevo);
+}
+
+function papelera(p) {
+  var f = buscar(p.id, String(p.ref || ''));
+  if (!f) return { ok: true, noexiste: true };
+  if (!f.isTrashed()) {
+    var antes = padres(f);
+    f.setTrashed(true);
+    antes.forEach(limpiar);
+  }
+  return { ok: true };
+}
+`;
+  function driveScript(key) {
+    if (!/^[\w-]{16,128}$/.test(String(key || ''))) throw new Error('Clave no válida');
+    return DRIVE_GS.replace('__CLAVE__', key);
+  }
+
   const api = {
     TZ, formatMoney, isMoney, evalAmount, parseNumberToken, splitEven, sum, mulDivRound,
     setCurrency, CUR, CUR_SYMBOLS, todayISO, nowTime, addDays, diffDays, dow, daysInMonth, monthKey, addMonthsKey, monthDiff, addMonthsISO, monthLabel, MONTHS, iso, parts,
@@ -695,7 +915,8 @@
     loanTotalInterest, loanSchedule, loanSummary, allocatePayment,
     budgetBase, budgetStatus, txMatchesScope, goalSummary, wishPlan, wishMonthly,
     duplicateScore, parsePastedText, parseReceiptText, receiptLinesFromWords, mergeReceiptReads, parseAmountToken, csvSafe, toCSV, parseCSV, parseDateFlexible,
-    encryptBackup, decryptBackup, hashPin, b64, unb64
+    encryptBackup, decryptBackup, hashPin, b64, unb64,
+    driveSafe, driveTarget, driveScript, DRIVE_SCRIPT_VERSION, DRIVE_MONTHS
   };
   root.WWCore = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

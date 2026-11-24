@@ -3,3 +3,7 @@ tools/scanlab/imgs/
 tools/scanlab/gt/
 tools/scanlab/out/
 __pycache__/
+
+# Laboratorio de Drive: certificado temporal y capturas
+tools/drivelab/.cert/
+tools/drivelab/out/

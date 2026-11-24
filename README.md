@@ -2,7 +2,7 @@
 
 PWA privada de finanzas personales: gastos, ingresos, presupuestos, cuentas, tarjetas a cuotas, gastos compartidos, préstamos, lista de deseos con fondo mensual, recurrencias con festivos colombianos, copias cifradas e importación CSV.
 
-**Todo se guarda en el dispositivo** (IndexedDB). No hay servidor, no hay cuentas, no se envía nada a Internet.
+**Todo se guarda en el dispositivo** (IndexedDB). No hay servidor ni cuentas. Lo único que puede salir del teléfono son las facturas que tú decidas copiar a **tu propio Google Drive** (opcional, ver abajo) y la búsqueda del mapa.
 
 ## Instalar en el iPhone (gratis, ~10 minutos)
 
@@ -24,7 +24,7 @@ Alternativas gratuitas equivalentes: Cloudflare Pages o Netlify (arrastrar la ca
 ```bash
 python3 -m http.server 8765    # dentro de esta carpeta
 # abre http://localhost:8765
-node --test tests/              # pruebas del núcleo financiero
+node tests/core.test.cjs        # pruebas del núcleo (y del programa de Google Drive)
 ```
 
 ## Copias de seguridad (importante)
@@ -38,6 +38,27 @@ Formato del archivo (JSON):
   data:   base64(AES-256-GCM(JSON del estado + comprobantes + manifiesto)) }
 ```
 
+## Facturas en Google Drive (opcional)
+Cada factura o soporte que guardes se copia solo a tu Google Drive, ordenado así:
+
+```
+WalletWeb / 2026 / 11 Noviembre / Gasto / Necesario / 20261124 Laura Koaj.pdf
+          año    mes            tipo    categoría    AAAAMMDD Persona(s) Tienda
+```
+
+- Tipos: Gasto, Ingreso y Transferencia (con su categoría en gastos e ingresos); los movimientos de préstamos van en `Préstamo / Entregados, Recibidos, Abonos recibidos o Abonos pagados`. Los meses llevan número para que Drive los ordene en orden de calendario.
+- Si cambias la fecha, el tipo, la categoría, las personas o la tienda de un movimiento, su archivo se mueve y se renombra solo. Si cambias la factura, la anterior va a la papelera de Drive. Si eliminas el movimiento, el archivo va a la papelera de Drive; si lo restauras, vuelve. Dos facturas con el mismo nombre quedan como `… (2).pdf`.
+- Las carpetas que quedan vacías se mandan a la papelera (nunca la carpeta `WalletWeb` ni carpetas creadas por ti).
+
+**Cómo se conecta (una sola vez, ~5 minutos).** No hay servidor de WalletWeb: la app le envía las facturas a un pequeño programa de Google Apps Script que instalas en tu propia cuenta de Google. Así la conexión no vence (el inicio de sesión de Google dentro de una app web instalada en el iPhone caduca cada hora).
+1. *Ajustes → Facturas en Google Drive → Copiar código* (trae una clave secreta que solo conoce tu app). Los pasos 2 a 4 son más fáciles en un computador: envíatelo por AirDrop, Notas o correo.
+2. Entra a [script.google.com](https://script.google.com/home/projects/create) con tu cuenta de Google (abre un proyecto nuevo). Arriba, donde dice *Proyecto sin título*, ponle de nombre **WalletWeb Drive**. Borra lo que trae el editor, pega el código y guarda (ícono del disquete).
+3. *Implementar → Nueva implementación* → en el engranaje, **Aplicación web** → *Ejecutar como*: **Yo** → *Quién tiene acceso*: **Cualquier usuario** → *Implementar*.
+4. Google pide permiso para tu Drive: *Autorizar acceso* → tu cuenta → *Configuración avanzada* → *Ir a WalletWeb Drive (no seguro)* → *Permitir*. El aviso sale porque el programa es tuyo y no está publicado en ninguna tienda.
+5. Copia la **URL de la aplicación web** (termina en `/exec`), pégala en la app y toca **Conectar**. Se suben también las facturas que ya tenías.
+
+Detalles: la subida es automática al guardar y al abrir la app (se puede apagar y usar *Sincronizar ahora*); sin Internet queda pendiente y se reintenta sola. El programa solo crea, renombra, mueve o manda a la papelera archivos que él mismo creó (cada uno lleva `WalletWeb ref:<id>` en su descripción); la URL sin la clave no sirve para nada. El perfil de demostración nunca se conecta. *Desconectar* deja de subir y no borra nada de Drive. Si algún día cambias el código en Apps Script, publícalo en *Implementar → Gestionar implementaciones → Editar → Versión nueva* para conservar la misma URL.
+
 ## Atajo de iPhone (para compras con tarjeta)
 En iOS, un Atajo que abre una URL lo hace en Safari, **no** en la app instalada (y Safari tiene otros datos). Por eso el flujo recomendado usa el portapapeles:
 1. App Atajos → Automatización → **Transacción** (Wallet) o cualquier disparador.
@@ -48,6 +69,7 @@ En iOS, un Atajo que abre una URL lo hace en Safari, **no** en la app instalada 
 También puedes pegar ahí el texto de una notificación de Rappi, Nequi o un correo.
 
 ## Qué incluye esta versión
+- **Facturas en Google Drive** (v1.33): Ajustes → Facturas en Google Drive. Cada comprobante se copia solo a tu Drive en `WalletWeb / año / mes / tipo / categoría / AAAAMMDD Persona Tienda.pdf`, y se mueve, renombra o va a la papelera cuando editas, eliminas o restauras el movimiento (ver la sección de arriba). **Estabilidad**: la app espera a que carguen todos sus archivos antes de leer los datos y dibujar (antes, en un arranque rápido el Inicio podía fallar y verse "sin datos" hasta refrescar).
 - Inicio: disponible del mes, presupuestos, ingresos esperados vs recibidos, alertas por reglas (con "por qué veo esto"), pendientes, recientes, lista de deseos (fondo, proyección y para cuántos te alcanza), tendencia 6 meses, comparación mensual e interanual, proyección, categorías principales, compras a cuotas (compromiso total y flujo mensual), próximos pagos.
 - Cuentas: ya no hay sección de cuentas ni saldos. Al registrar un movimiento eliges la cuenta (para verificar con qué pagaste) y escribes la **referencia de pago**; la app avisa si esa referencia ya existe. Los nombres de cuentas se corrigen en Ajustes → Cuentas.
 - Categorías de gasto: **Necesario, Entretenimiento, Inversión y Préstamo**, con subcategoría opcional en cada gasto (Mercado, Restaurantes, Educación…). Puedes crear subcategorías nuevas desde el mismo formulario con "+ Nueva" o en Ajustes → Categorías. Los datos anteriores se reorganizan solos.

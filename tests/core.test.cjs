@@ -1,4 +1,4 @@
-// Ejecutar: node --test tests/
+// Ejecutar: node tests/core.test.cjs
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const C = require('../core.js');
@@ -263,4 +263,75 @@ test('lista de deseos: fondo mensual, plan por prioridad y fecha en que alcanza'
   const q = C.wishPlan(fund, wishes, '2026-11-21');
   assert.equal(q.available, 1020000);
   assert.equal(q.projection, 1520000);
+});
+
+test('Drive: carpeta y nombre de cada comprobante', () => {
+  const t = C.driveTarget({ root: 'WalletWeb', date: '2026-11-24', type: 'expense', category: 'Necesario', people: ['Laura'], merchant: 'Koaj', mime: 'application/pdf' });
+  assert.deepEqual(t.path, ['WalletWeb', '2026', '11 Noviembre', 'Gasto', 'Necesario']);
+  assert.equal(t.name, '20261124 Laura Koaj.pdf');
+  assert.equal(C.driveTarget({ date: '2026-01-05', type: 'income', category: 'Salario', mime: 'image/jpeg' }).key, 'WalletWeb/2026/01 Enero/Ingreso/Salario/20260105 Comprobante.jpg');
+  assert.deepEqual(C.driveTarget({ date: '2026-03-09', type: 'transfer', mime: 'image/png', fallback: 'Transferencia' }).path, ['WalletWeb', '2026', '03 Marzo', 'Transferencia']);
+  assert.equal(C.driveTarget({ date: '2026-03-09', type: 'expense', category: 'Necesario', sub: 'Mercado', mime: 'application/pdf' }).name, '20260309 Mercado.pdf');
+  assert.equal(C.driveTarget({ date: '2026-03-09', type: 'expense', mime: 'application/pdf' }).path[4], 'Sin categoría');
+  assert.equal(C.driveTarget({ date: '2026-03-09', type: 'repay_in', people: ['Camilo'], mime: 'application/pdf' }).key, 'WalletWeb/2026/03 Marzo/Préstamo/Abonos recibidos/20260309 Camilo.pdf');
+  // varias personas y caracteres que Drive no acepta en un nombre
+  assert.equal(C.driveTarget({ date: '2026-12-31', type: 'expense', category: 'Ocio/Salidas', people: ['Ana', 'Luis'], merchant: 'Cine "Centro"', mime: 'image/heic' }).key, 'WalletWeb/2026/12 Diciembre/Gasto/Ocio Salidas/20261231 Ana y Luis Cine Centro.heic');
+  assert.equal(C.driveTarget({ date: '2026-12-31', type: 'expense', people: ['A', 'B', 'C', 'D'], mime: 'application/pdf' }).name, '20261231 A, B y 2 más.pdf');
+  assert.throws(() => C.driveScript('corta'));
+});
+
+test('Drive: el programa de Apps Script ordena, renombra, mueve y manda a la papelera solo lo suyo', () => {
+  const { makeDrive, loadScript } = require('./drive-mock.cjs');
+  const KEY = 'k'.repeat(32), drive = makeDrive(), s = loadScript(C.driveScript(KEY), drive);
+  const pdf = Buffer.from('%PDF-1.4 prueba').toString('base64');
+  assert.equal(s.post({ clave: 'otra', accion: 'probar' }).error, 'clave');
+  const pr = s.post({ clave: KEY, accion: 'probar', raiz: 'WalletWeb' });
+  assert.ok(pr.ok && pr.version === C.DRIVE_SCRIPT_VERSION && pr.cuenta === 'cuenta@example.com' && pr.carpeta);
+  const ruta = ['WalletWeb', '2026', '11 Noviembre', 'Gasto', 'Necesario'];
+  const up = (ref, extra) => s.post(Object.assign({ clave: KEY, accion: 'subir', ref, ruta, nombre: '20261124 Laura Koaj.pdf', ver: 'v1', tipo: 'application/pdf', datos: pdf, descripcion: 'Gasto de $ 39.330' }, extra));
+  const a = up('tx-aaaaaa');
+  assert.ok(a.ok && a.id && a.nombre === '20261124 Laura Koaj.pdf');
+  assert.deepEqual(drive.files(), ['WalletWeb/2026/11 Noviembre/Gasto/Necesario/20261124 Laura Koaj.pdf']);
+  assert.match(drive.byId(a.id).desc, /WalletWeb ref:tx-aaaaaa v:v1/);
+  // la respuesta se perdió y la app reintenta: no se duplica
+  assert.equal(up('tx-aaaaaa').id, a.id);
+  drive.cache.clear(); assert.equal(up('tx-aaaaaa').id, a.id);
+  // otro movimiento con el mismo nombre ese día
+  const b = up('tx-bbbbbb');
+  assert.equal(b.nombre, '20261124 Laura Koaj (2).pdf');
+  // se edita el movimiento A (otra categoría): se mueve, no se vuelve a subir
+  const rE = ['WalletWeb', '2026', '11 Noviembre', 'Gasto', 'Entretenimiento'];
+  const m = s.post({ clave: KEY, accion: 'subir', ref: 'tx-aaaaaa', id: a.id, ruta: rE, nombre: '20261124 Laura Koaj.pdf', ver: 'v1' });
+  assert.ok(m.ok && m.id === a.id);
+  assert.deepEqual(drive.files(), ['WalletWeb/2026/11 Noviembre/Gasto/Entretenimiento/20261124 Laura Koaj.pdf', 'WalletWeb/2026/11 Noviembre/Gasto/Necesario/20261124 Laura Koaj (2).pdf']);
+  // B se elimina en la app: a la papelera, y su carpeta vacía también
+  assert.ok(s.post({ clave: KEY, accion: 'papelera', ref: 'tx-bbbbbb', id: b.id }).ok);
+  assert.deepEqual(drive.trashedFiles(), ['WalletWeb/2026/11 Noviembre/Gasto/Necesario/20261124 Laura Koaj (2).pdf']);
+  assert.ok(!drive.folders().includes('WalletWeb/2026/11 Noviembre/Gasto/Necesario'));
+  // B se restaura: sale de la papelera y queda en su carpeta (que se vuelve a crear)
+  const rb = s.post({ clave: KEY, accion: 'subir', ref: 'tx-bbbbbb', id: b.id, ruta, nombre: '20261124 Laura Koaj.pdf', ver: 'v1' });
+  assert.ok(rb.ok && rb.id === b.id && rb.nombre === '20261124 Laura Koaj.pdf');
+  assert.ok(drive.files().includes('WalletWeb/2026/11 Noviembre/Gasto/Necesario/20261124 Laura Koaj.pdf'));
+  // A cambia de factura (otra foto): la anterior va a la papelera y la nueva conserva el nombre
+  const a2 = up('tx-aaaaaa', { id: a.id, ruta: rE, ver: 'v2' });
+  assert.ok(a2.ok && a2.id !== a.id && a2.nombre === '20261124 Laura Koaj.pdf');
+  assert.equal(drive.byId(a.id).trashed, true);
+  // seguridad: nunca toca archivos que no creó, ni con la clave correcta
+  const mine = drive.userFile(drive.root, 'Mi contrato.pdf');
+  assert.equal(s.post({ clave: KEY, accion: 'papelera', ref: 'tx-aaaaaa', id: mine.id }).noexiste, true);
+  assert.equal(s.post({ clave: KEY, accion: 'subir', ref: 'tx-aaaaaa', id: mine.id, ruta, nombre: 'x.pdf', ver: 'v1' }).error, 'noexiste');
+  assert.equal(mine.trashed, false); assert.equal(mine.parents[0], drive.root.id);
+  // la carpeta principal siempre es WalletWeb, y nunca borra carpetas de la persona
+  const u = drive.userFolder(drive.byId(drive.items.get(a2.id).parents[0]), 'Notas mías');
+  const x = s.post({ clave: KEY, accion: 'subir', ref: 'tx-cccccc', ruta: ['Documentos', '2026', '12 Diciembre', 'Gasto'], nombre: '20261201 Factura.pdf', ver: 'v1', tipo: 'application/pdf', datos: pdf });
+  assert.ok(drive.files().includes('WalletWeb/2026/12 Diciembre/Gasto/20261201 Factura.pdf'));
+  s.post({ clave: KEY, accion: 'papelera', ref: 'tx-aaaaaa', id: a2.id });
+  assert.equal(u.trashed, false);
+  assert.ok(drive.folders().includes('WalletWeb/2026/11 Noviembre/Gasto/Entretenimiento/Notas mías'));
+  s.post({ clave: KEY, accion: 'papelera', ref: 'tx-cccccc', id: x.id });
+  assert.ok(drive.folders().includes('WalletWeb'));
+  // archivo borrado para siempre en Drive: la app lo vuelve a subir
+  drive.byId(b.id).gone = true;
+  assert.equal(s.post({ clave: KEY, accion: 'subir', ref: 'tx-bbbbbb', id: b.id, ruta, nombre: '20261124 Laura Koaj.pdf', ver: 'v1' }).error, 'noexiste');
+  assert.match(s.api.doGet().text, /funcionando/);
 });

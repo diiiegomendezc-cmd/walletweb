@@ -830,3 +830,17 @@ body.privacy .mb-tot { filter: blur(6px); }
 .prof-pick .s { font-size: 12.5px; color: var(--ink-2); }
 .prof-pick[aria-current="true"] { background: var(--fill); }
 .prof-av { width: 40px; height: 40px; border-radius: 50%; flex: none; display: grid; place-items: center; font-weight: 750; font-size: 17px; color: var(--cc); background: color-mix(in srgb, var(--cc) 18%, transparent); }
+
+/* Facturas en Google Drive */
+.drv-tree { padding: 10px 12px; border-radius: 16px; background: var(--fill); border: 1px solid var(--line); font-size: 13.5px; line-height: 1.3; }
+.drv-node { display: flex; align-items: center; gap: 7px; padding: 3px 0 3px calc(var(--d, 0) * 12px); min-width: 0; color: var(--ink-2); }
+.drv-node span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drv-node .i { flex: none; width: 16px; height: 16px; }
+.drv-node.file { color: var(--ink); font-weight: 650; }
+.drv-steps { margin: 4px 0 0; padding-left: 22px; line-height: 1.5; font-size: 14.5px; }
+.drv-steps li { margin: 0 0 12px; padding-left: 2px; }
+.drv-steps code { font-size: 13px; }
+.drv-btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.drv-code { margin: 6px 0 0; }
+.drv-code summary { cursor: pointer; font-weight: 600; padding: 8px 2px; }
+.drv-code textarea { font: 11.5px/1.45 ui-monospace, Menlo, monospace; width: 100%; min-height: 170px; white-space: pre; overflow: auto; resize: vertical; }

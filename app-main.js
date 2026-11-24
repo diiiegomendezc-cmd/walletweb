@@ -369,7 +369,7 @@ document.addEventListener('change', e => {
     let v = t.type === 'checkbox' ? t.checked : t.value;
     if (['lockMinutes', 'warnPct'].includes(key)) v = Number(v);
     if (scope === 'ui') { ui[key] = v; ui.movLimit = 60; render(); }
-    else { S.settings[key] = v; save(); if (key === 'privacy') applyPrivacy(); if (!sheets.length) render(); }
+    else if (key) { S.settings[key] = v; save(); if (key === 'privacy') applyPrivacy(); if (!sheets.length) render(); }
     return;
   }
   if (t.dataset.rerender !== undefined) {
@@ -528,6 +528,7 @@ async function restoreRun() {
   const next = migrate(RESTORE.data.state);
   if (keepSecurity.pin) next.settings.pin = keepSecurity.pin;
   next.settings.passkey = keepSecurity.passkey; next.settings.onboarded = true;
+  if (typeof driveKeepOnRestore === 'function') driveKeepOnRestore(next);
   for (const [id, r] of Object.entries(RESTORE.data.receipts || {})) await Store.set('rcpt:' + id, new Blob([C.unb64(r.data)], { type: r.type }));
   const ids = new Set(next.audit.map(a => a.id));
   next.audit = next.audit.concat(S.audit.filter(a => !ids.has(a.id))).sort((a, b) => b.at.localeCompare(a.at));
@@ -788,6 +789,8 @@ function migrate(st) {
   if ((out.schema || 1) < 4) { migrateGoalsToWishes(out); out.schema = 4; }
   if (out.schema < 5) out.schema = 5; // v1.20: gráficos propios (S.charts) y filtros de los del Inicio
   assignPalettes(out.categories); if (out.schema < 6) out.schema = 6; // v1.23: familia de color por categoría
+  if (!out.driveFiles || typeof out.driveFiles !== 'object' || Array.isArray(out.driveFiles)) out.driveFiles = {};
+  if (out.schema < 7) out.schema = 7; // v1.33: facturas en Google Drive (S.settings.drive y S.driveFiles)
   return out;
 }
 async function purgeTrash() {
@@ -857,12 +860,15 @@ async function init() {
   else if (S.demo && !IN_FRAME && !S.settings.pin && !S.settings.onboarded) onboarding();
   handleUrlParams();
   dailySnapshot();
+  if (typeof driveBoot === 'function') driveBoot();
   try { if (navigator.storage?.persist) navigator.storage.persist(); } catch (e) { /* */ }
   if (!IN_FRAME && 'serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
     navigator.serviceWorker.register('./sw.js').catch(() => { /* la app funciona igual sin SW */ });
   }
 }
-init();
+// Los archivos que se cargan después de este (gráficos, efectos, préstamos, colores, perfiles, Drive) deben estar listos antes de
+// dibujar: si la base de datos abría más rápido que el navegador cargaba esos archivos, el Inicio fallaba y se veía "sin datos".
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true }); else init();
 
 // Mantener presionada la barra inferior abre el editor del menú
 (() => {
