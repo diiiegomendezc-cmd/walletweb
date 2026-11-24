@@ -1,4 +1,4 @@
-"""Generador de fotos sintéticas de tirillas sostenidas en la mano (parecidas a la foto real de KOAJ).
+"""Generador de fotos sintéticas de tirillas sostenidas en la mano (como las de un almacén de ropa).
 Uso: python3 gen.py N [semilla]  -> imgs/syn_###.jpg, gt/syn_###.png (máscara del papel), gt/syn_###.json
 """
 import json, math, os, random, sys
@@ -22,7 +22,7 @@ PRODUCTS = ['SHORT KOAJ MAUS', 'MEDIAS KOAJ TOBILLERA', 'CAMISETA BASICA', 'JEAN
             'CREMA DENTAL COLGATE', 'GASEOSA POSTOBON 1.5L', 'CHOCOLATINA JET', 'BUSO CAPOTA GRIS', 'GORRA NEGRA', 'PANTALON DRIL',
             'JABON REY X3', 'ATUN VAN CAMPS', 'ACEITE GIRASOL 1L', 'CERVEZA CLUB COLOMBIA', 'BLUSA FLORES', 'CORREA CUERO']
 CITIES = ['Cundinamarca', 'Bogota D.C.', 'Medellin', 'Cali', 'Barranquilla', 'Bucaramanga']
-NAMES = ['FLOR CASTAÑEDA', 'JUAN PEREZ', 'MARIA GOMEZ', 'CARLOS RUIZ', 'ANA TORRES', 'CONSUMIDOR FINAL']
+NAMES = ['LUISA FERNANDEZ', 'JUAN PEREZ', 'MARIA GOMEZ', 'CARLOS RUIZ', 'ANA TORRES', 'CONSUMIDOR FINAL']
 
 
 def money(v, sep='.'):

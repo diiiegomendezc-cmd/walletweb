@@ -517,6 +517,8 @@ async function restoreRun() {
     catch (e) { return err(e.message); }
     const st = RESTORE.data.state;
     if (!st || !Array.isArray(st.transactions) || !Array.isArray(st.accounts)) { RESTORE.data = null; return err('La copia no tiene el formato esperado.'); }
+    const odd = C.unsafeStateFields(st);
+    if (odd.length) { RESTORE.data = null; return err('La copia tiene datos con un formato no válido y no se restauró (posible archivo alterado): ' + odd.slice(0, 3).join(', ')); }
     $('#rsPrev').innerHTML = `<div class="card"><b>Integridad verificada</b><dl class="kv" style="margin-top:8px"><dt>Creada</dt><dd>${esc(fdt(RESTORE.data.exportedAt))}</dd><dt>Versión</dt><dd>${esc(RESTORE.data.appVersion)} · esquema ${esc(st.schema)}</dd><dt>Movimientos</dt><dd>${st.transactions.length}</dd><dt>Cuentas</dt><dd>${st.accounts.length}</dd><dt>Préstamos</dt><dd>${st.loans.length}</dd><dt>Comprobantes incluidos</dt><dd>${Object.keys(RESTORE.data.receipts || {}).length}</dd></dl></div>`;
     topSheet().setFooter(`<button class="btn danger" data-act="restoreRun">Reemplazar mis datos</button><button class="btn" data-act="closeSheet">Cancelar</button>`);
     return;
@@ -839,8 +841,9 @@ async function loadState() {
 }
 function renderLoadError() {
   Store.readOnly = true;
-  $('#view').innerHTML = `<div class="card" style="margin-top:20px">${emptyState('alert', 'No pudimos abrir tus datos', 'El iPhone no entregó la base de datos a tiempo. Tus datos no se han tocado: vuelve a intentarlo.', '<button class="btn primary" onclick="location.reload()">Reintentar</button>')}</div>`;
+  $('#view').innerHTML = `<div class="card" style="margin-top:20px">${emptyState('alert', 'No pudimos abrir tus datos', 'El iPhone no entregó la base de datos a tiempo. Tus datos no se han tocado: vuelve a intentarlo.', '<button class="btn primary" data-act="reloadApp">Reintentar</button>')}</div>`;
 }
+ACT.reloadApp = () => location.reload(); // sin onclick en línea: la CSP (script-src 'self') lo bloquearía
 async function init() {
   const ld = await loadState();
   if (ld.failed && !IN_FRAME) { applyTheme(); renderLoadError(); return; }

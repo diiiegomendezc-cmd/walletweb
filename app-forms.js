@@ -992,7 +992,8 @@ function mapLoadTiles(k) {
     mapMessage(navigator.onLine === false ? 'Tu teléfono está sin conexión a internet.' : 'Los servidores de mapas no respondieron. Puede ser una red que los bloquea (por ejemplo la del trabajo).', true);
     return;
   }
-  const box = $('#mapBox'); box.classList.toggle('osm', p.id === 'osm');
+  const box = $('#mapBox'); if (!box) return; // el mapa ya se cerró
+  box.classList.toggle('osm', p.id === 'osm');
   let ok = 0, bad = 0;
   const layer = L.tileLayer(p.url(), Object.assign({ referrerPolicy: 'strict-origin-when-cross-origin', crossOrigin: false }, p.opts));
   layer.on('tileload', () => { if (!ok++) mapMessage(''); });

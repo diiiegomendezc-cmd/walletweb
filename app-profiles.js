@@ -14,14 +14,17 @@ function profButton() {
   b.innerHTML = `<span>${esc(profInitial(PROFILE))}</span>`;
 }
 
+// En la Demostración solo se puede editar la propia demostración: quien tiene el teléfono prestado no toca tus perfiles
+const profCanEdit = p => !PROFILE.demo || p.demo;
 function profilesBody() {
   return `<div class="list">${PROFILES.list.map(p => `<div class="row-item prof-row">
       <button class="prof-pick" data-act="profSwitch" data-v="${esc(p.id)}" aria-current="${p.id === PROFILE.id}">
         <span class="prof-av" style="--cc:${profColor(p)}">${esc(profInitial(p))}</span>
         <span class="grow"><span class="t">${esc(p.name)}${p.id === PROFILE.id ? ' <span class="pill info">En uso</span>' : ''}</span><span class="s">${esc(p.currency)} · ${p.demo ? 'Datos ficticios para mostrar la app' : p.id === 'main' ? 'Perfil principal' : 'Perfil adicional'}</span></span>
       </button>
-      <button class="icon-btn" data-act="profEdit" data-v="${esc(p.id)}" aria-label="Editar ${esc(p.name)}">${ic('edit', 'sm')}</button></div>`).join('')}</div>
-    <p class="hint">Cada perfil tiene sus propios movimientos, categorías, préstamos, ajustes y PIN. Para mostrar la app usa <b>Demostración</b>: al volver a tu perfil se pide tu PIN si lo tienes.</p>`;
+      ${profCanEdit(p) ? `<button class="icon-btn" data-act="profEdit" data-v="${esc(p.id)}" aria-label="Editar ${esc(p.name)}">${ic('edit', 'sm')}</button>` : ''}</div>`).join('')}</div>
+    <p class="hint">Cada perfil tiene sus propios movimientos, categorías, préstamos, ajustes y PIN. Para mostrar la app usa <b>Demostración</b>: al volver a tu perfil se pide tu PIN si lo tienes.</p>
+    ${!PROFILE.demo && !hasLock() ? '<p class="hint" style="color:var(--neg);font-weight:600">Este perfil no tiene PIN: si prestas el teléfono en Demostración, cualquiera puede volver a él. Ponlo en Ajustes → Bloqueo y desbloqueo.</p>' : ''}`;
 }
 function profilesSheet() {
   const s = sheets.find(x => x.id === 'prof');
@@ -30,12 +33,13 @@ function profilesSheet() {
 }
 function profEditSheet(id) {
   const p = id ? PROFILES.list.find(x => x.id === id) : null;
+  if (p && !profCanEdit(p)) { toast('Desde la demostración no se pueden cambiar otros perfiles.'); return; }
   openSheet({ id: 'profE', title: p ? 'Editar perfil' : 'Nuevo perfil', body: `
     <div class="field"><label for="pfN">Nombre</label><input id="pfN" class="input" value="${esc(p?.name || '')}" placeholder="Ej.: Negocio, Viaje, Mamá" maxlength="30" autocomplete="off"></div>
     <div class="field"><label for="pfC">Moneda</label><select id="pfC" class="input">${optionList(CURRENCIES.map(([c, n]) => [c, `${c} · ${n} (${C.CUR_SYMBOLS[c]})`]), p?.currency || 'COP')}</select>
       <p class="hint">Cambia el símbolo con que se muestran los montos. Los valores se manejan sin centavos.</p></div>
     ${p?.demo ? `<button class="btn block" data-act="profDemoReset">${ic('undo', 'sm')} Restablecer datos ficticios</button>` : ''}
-    ${p && p.id !== 'main' && !p.demo ? `<button class="btn block" style="margin-top:10px;color:var(--neg)" data-act="profDelete" data-v="${esc(p.id)}">${ic('trash', 'sm')} Eliminar perfil y sus datos</button>` : ''}
+    ${p && p.id !== 'main' && !p.demo ? (p.id === PROFILE.id ? `<button class="btn block" style="margin-top:10px;color:var(--neg)" data-act="profDelete" data-v="${esc(p.id)}">${ic('trash', 'sm')} Eliminar perfil y sus datos</button>` : '<p class="hint">Para eliminar este perfil, ábrelo primero (te pedirá su PIN si lo tiene).</p>') : ''}
     <div id="pfErr" class="err" role="alert"></div>`,
     footer: `<button class="btn primary" data-act="profSave" data-v="${esc(p?.id || '')}">${p ? 'Guardar' : 'Crear y abrir'}</button>` });
 }
@@ -71,7 +75,8 @@ Object.assign(ACT, {
     if (!name) { $('#pfErr').textContent = 'Escribe un nombre.'; return; }
     const id = el.dataset.v;
     if (id) {
-      const p = PROFILES.list.find(x => x.id === id); p.name = name.slice(0, 30); p.currency = cur; saveProfiles();
+      const p = PROFILES.list.find(x => x.id === id); if (!p || !profCanEdit(p)) return;
+      p.name = name.slice(0, 30); p.currency = cur; saveProfiles();
       if (p.id === PROFILE.id) { C.setCurrency(cur); profButton(); }
       await closeSheet(true); profilesSheet(); render(); toast('Perfil actualizado');
     } else {
@@ -82,6 +87,8 @@ Object.assign(ACT, {
   },
   profDelete: async el => {
     const p = PROFILES.list.find(x => x.id === el.dataset.v); if (!p || p.id === 'main' || p.demo) return;
+    if (p.id !== PROFILE.id) { toast('Abre ese perfil para eliminarlo.'); return; } // así se pide su PIN
+    if (!(await reauth('Desbloquea para eliminar este perfil y todos sus datos.'))) return;
     if (!(await confirmDialog(`Se borrarán todos los datos del perfil "${p.name}" de este teléfono. Esto no se puede deshacer.`, { title: 'Eliminar perfil', confirmText: 'Eliminar', danger: true, typed: 'ELIMINAR' }))) return;
     const st = await Store.getStrict(stateKey(p.id));
     await clearProfileData(p.id, st.ok && st.value ? st.value.transactions || [] : []);

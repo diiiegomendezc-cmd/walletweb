@@ -417,7 +417,7 @@
     return Number.isFinite(v) ? Math.round(v) : null;
   }
   // Números de una línea con su posición. Se ignoran porcentajes, fechas/horas y números pegados a letras
-  // (códigos como S17E-56012 o 1_FAC).
+  // (códigos como S04E-31877 o 1_FAC).
   function amountTokens(line) {
     const re = /[-–]?\$?\s?\d[\d.,]*/g, out = []; let m;
     while ((m = re.exec(line))) {
@@ -438,7 +438,7 @@
   function plain(s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); }
   const LETTERS = /[A-Za-zÁÉÍÓÚÑáéíóúñ]/g;
   const nLetters = s => (String(s).match(LETTERS) || []).length;
-  // Nombre de la tienda: "TIENDA KOAJ CALLE 12" → KOAJ; razón social (LTDA, S.A.S.) seguida de la marca → la marca
+  // Nombre de la tienda: "TIENDA KOAJ PLAZA NORTE" → KOAJ; razón social (LTDA, S.A.S.) seguida de la marca → la marca
   function receiptMerchant(lines) {
     const ADDR = /\b(calle|cll|cl|carrera|cra|kr|avenida|av|diagonal|dg|transversal|tv|centro|cc|c\.c|local|piso|barrio|no|km)\b|#|\d/;
     const SKIPM = /(nit|tel|ciudad|caja|factura|fecha|hora|cliente|vendedor|consecutivo|regimen|resoluci|iva|responsable|codigo|descripcion|direcci|www|\.com|cajero|turno)/;
@@ -907,6 +907,41 @@ function papelera(p) {
     return DRIVE_GS.replace('__CLAVE__', key);
   }
 
+
+  /* ---------------- Copias restauradas: revisión de formato ----------------
+     Los identificadores, fechas, colores y algunos números se insertan en el HTML sin escapar porque siempre los genera la
+     app. Una copia manipulada podría traer otra cosa: antes de restaurarla se revisa que tengan el formato esperado.
+     Devuelve la lista de campos con formato raro (vacía si todo está bien). */
+  const RX_ID = /^[\w.:@-]{1,200}$/, RX_DATE = /^\d{4}-\d{2}(-\d{2})?$/, RX_COLOR = /^#[0-9a-fA-F]{3,8}$/, RX_NUM = /^-?\d+(\.\d+)?$/;
+  const STATE_DATE_KEYS = new Set(['date', 'due', 'nominal', 'firstDue', 'startDate', 'firstMonth', 'start', 'from', 'to', 'end', 'horizon']);
+  const STATE_NUM_KEYS = new Set(['cuotas', 'transparency', 'blur', 'refract']);
+  function unsafeStateFields(st) {
+    const bad = [];
+    const walk = (o, path, depth) => {
+      if (bad.length >= 10) return;
+      if (depth > 16) { bad.push(path); return; }
+      for (const [k, v] of Object.entries(o)) {
+        const p = path + (Array.isArray(o) ? '[' + k + ']' : '.' + k);
+        if (v === null || v === undefined || v === '' || typeof v === 'boolean') continue;
+        if (typeof v === 'object') {
+          if (p === 'copia.settings.passkey') continue; // la app conserva la del dispositivo
+          const prim = Array.isArray(v) && v.every(x => x === null || typeof x !== 'object');
+          if (prim && (k === 'people' || k === 'splitPeople') && v.some(x => !RX_ID.test(String(x)))) bad.push(p);
+          else if (prim && (k === 'extraHolidays' || k === 'workdays') && v.some(x => !RX_DATE.test(String(x)))) bad.push(p);
+          else walk(v, p, depth + 1);
+          continue;
+        }
+        const s = String(v);
+        if ((k === 'id' || /Id$/.test(k)) && !RX_ID.test(s)) bad.push(p);
+        else if (STATE_DATE_KEYS.has(k) && typeof v === 'string' && !RX_DATE.test(s)) bad.push(p);
+        else if ((k === 'color' || k === 'colorHex') && !RX_COLOR.test(s)) bad.push(p);
+        else if (STATE_NUM_KEYS.has(k) && typeof v !== 'number' && !RX_NUM.test(s)) bad.push(p);
+      }
+    };
+    if (st && typeof st === 'object') walk(st, 'copia', 0); else bad.push('copia');
+    return bad;
+  }
+
   const api = {
     TZ, formatMoney, isMoney, evalAmount, parseNumberToken, splitEven, sum, mulDivRound,
     setCurrency, CUR, CUR_SYMBOLS, todayISO, nowTime, addDays, diffDays, dow, daysInMonth, monthKey, addMonthsKey, monthDiff, addMonthsISO, monthLabel, MONTHS, iso, parts,
@@ -916,7 +951,7 @@ function papelera(p) {
     budgetBase, budgetStatus, txMatchesScope, goalSummary, wishPlan, wishMonthly,
     duplicateScore, parsePastedText, parseReceiptText, receiptLinesFromWords, mergeReceiptReads, parseAmountToken, csvSafe, toCSV, parseCSV, parseDateFlexible,
     encryptBackup, decryptBackup, hashPin, b64, unb64,
-    driveSafe, driveTarget, driveScript, DRIVE_SCRIPT_VERSION, DRIVE_MONTHS
+    driveSafe, driveTarget, driveScript, DRIVE_SCRIPT_VERSION, DRIVE_MONTHS, unsafeStateFields
   };
   root.WWCore = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

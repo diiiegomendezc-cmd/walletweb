@@ -46,6 +46,7 @@ function driveDesc(t) {
   return [`${TYPES[t.type] || 'Movimiento'} de ${C.formatMoney(t.amount)}${cat ? ' · ' + cat : ''}`, [t.merchant, who].filter(Boolean).join(' · '), 'Fecha: ' + fdFull(t.date), 'Guardado con WalletWeb']
     .filter(Boolean).join('\n');
 }
+const driveLink = u => /^https:\/\/drive\.google\.com\/[^\s"'<>]*$/.test(String(u || '')) ? String(u) : '';
 const driveIsSynced = (t, f) => !!(f && f.id && !f.trashed && f.ver === driveVer(t));
 
 /* ---------- Qué falta hacer en Drive ---------- */
@@ -259,7 +260,7 @@ function driveBody() {
   }
   return `<div class="card flat" style="margin-bottom:12px"><div style="display:flex;gap:10px;align-items:center">${ic('check')}<div class="grow" style="min-width:0"><b>Conectado a Google Drive</b>
       <div class="small muted" style="overflow-wrap:anywhere">${esc(c.account || 'Tu cuenta de Google')}${c.connectedAt ? ' · desde ' + esc(fdt(c.connectedAt)) : ''}</div></div></div>
-      ${c.folderUrl ? `<a class="btn block" style="margin-top:12px" href="${esc(c.folderUrl)}" target="_blank" rel="noopener noreferrer">${ic('folder', 'sm')} Abrir la carpeta ${esc(driveRoot())}</a>` : ''}</div>
+      ${driveLink(c.folderUrl) ? `<a class="btn block" style="margin-top:12px" href="${esc(driveLink(c.folderUrl))}" target="_blank" rel="noopener noreferrer">${ic('folder', 'sm')} Abrir la carpeta ${esc(driveRoot())}</a>` : ''}</div>
     <div id="drvStatus" class="ocr-status" style="margin:0 0 6px">${driveStatusHTML()}</div>
     ${sw('settings.driveAuto', driveAutoOn(), 'Subir automáticamente', 'Al guardar un movimiento con factura y al abrir la app. Si lo apagas, usa "Sincronizar ahora".')}
     <div class="db-h" style="padding:12px 0 4px">Cómo se ordena</div>
@@ -340,7 +341,7 @@ function driveReceiptPill(t) {
 }
 function driveReceiptLink(t) {
   const f = (S.driveFiles || {})[t.id];
-  return driveIsSynced(t, f) && f.url ? `<a class="btn block drv-open" style="margin-top:10px" href="${esc(f.url)}" target="_blank" rel="noopener noreferrer">${ic('cloud', 'sm')} Abrir en Google Drive</a>` : '';
+  return driveIsSynced(t, f) && driveLink(f.url) ? `<a class="btn block drv-open" style="margin-top:10px" href="${esc(driveLink(f.url))}" target="_blank" rel="noopener noreferrer">${ic('cloud', 'sm')} Abrir en Google Drive</a>` : '';
 }
 Object.assign(ACT, {
   driveSheet: () => driveSheet(), driveConnect: el => driveConnect(el), driveSyncNow: () => driveSyncNow(), driveDisconnect: () => driveDisconnect(),

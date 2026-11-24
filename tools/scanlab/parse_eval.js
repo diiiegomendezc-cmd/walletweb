@@ -21,6 +21,6 @@ for (const f of fs.readdirSync(dir).filter(f => /^syn_\d+\.json$/.test(f)).sort(
 }
 const pc = (a, b) => (100 * a / Math.max(1, b)).toFixed(0) + '%';
 console.log(`fotos ${n}: total ${pc(tot, totN)} (${tot}/${totN})  iva ${pc(tax, taxN)}  fecha ${pc(date, n)}  tienda ${pc(merch, n)}  ítems ${pc(itemsHit, itemsN)}  sobrantes/foto ${(extra / Math.max(1, n)).toFixed(2)}`);
-// la foto real (KOAJ)
+// una foto real, si está en out/ (nunca se sube al repositorio)
 const real = path.join(dir, 'real.json');
 if (fs.existsSync(real)) { const t = JSON.parse(fs.readFileSync(real)).text; if (t) { const P = C.parseReceiptText(t); console.log('REAL:', JSON.stringify({ merchant: P.merchant, total: P.total, tax: P.tax, subtotal: P.subtotal, date: P.date, items: P.items.map(i => [i.name, i.qty, i.amount]) })); } }

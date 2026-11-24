@@ -194,19 +194,19 @@ test('lectura de tirilla de almacén: ítems en dos líneas, dígito mal leído,
   // Texto como lo entrega el lector: "79,940" es un 29.940 mal leído y el IVA quedó medio renglón arriba
   const txt = `PERMODA LTDA.
 NIT: 860.516.806 - 5
-TIENDA KOAJ CALLE 12 CENTRO
+TIENDA KOAJ PLAZA NORTE
 KOAJ
-Calle 7 # 12B-58 Piso 1
-1_FAC ELECTRONICA VENTA S17E-56012
-Consecutivo:S17E-56012
-Fecha: 30/08/26 Hora: 13:40:57
+Carrera 15 # 100-20 Local 8
+1_FAC ELECTRONICA VENTA S04E-31877
+Consecutivo:S04E-31877
+Fecha: 15/03/26 Hora: 10:12:33
 CODIGO DESCRIPCION
 COLOR TALLA UM CANT PRECIO DCTO TOTAL
-105236761012 SHORT KOAJ MAUS 27963 4/25
+100200300401 SHORT KOAJ MAUS 11223 1/26
 948 08 94 1 29.940 79,940
-105255761120 MEDIAS KOAJ TOBILLERA 29145
+100200300502 MEDIAS KOAJ TOBILLERA 33445
 910 9-11 94 1 4.740 4.70
-291318 BOLSA PAPEL
+200100 BOLSA PAPEL
 999 S 94 1 700 700
 T.Unid. VALOR DTO.LIN TOTAL
 3 35.380 0 35.380
@@ -221,10 +221,10 @@ AUTORRETENEDORES DE RENTA RES.007241 DEL`;
   const r = C.parseReceiptText(txt);
   assert.equal(r.total, 35380);
   assert.equal(r.merchant, 'KOAJ');
-  assert.equal(r.date, '2026-08-30');
+  assert.equal(r.date, '2026-03-15');
   assert.deepEqual(r.items.map(i => [i.name, i.amount]), [['SHORT KOAJ MAUS', 29940], ['MEDIAS KOAJ TOBILLERA', 4740], ['BOLSA PAPEL', 700]]);
   assert.equal(r.tax, 5650);              // 35.380 − 35.380/1,19
-  assert.equal(r.discount, null);         // "S17E-56012" es un código, no un descuento
+  assert.equal(r.discount, null);         // "S04E-31877" es un código, no un descuento
 });
 test('lectura: total con dos puntos, marca completa y dos lecturas que se completan', () => {
   const a = C.parseReceiptText('ARTURO CALLE S.A.S.\nTIENDA ARTURO CALLE CALLE 45 CENTRO\nARTURO CALLE\nCAMISA OXFORD 1 89.900\nTOTAL :    89.900\nTEF DEB 89.900');
@@ -334,4 +334,13 @@ test('Drive: el programa de Apps Script ordena, renombra, mueve y manda a la pap
   drive.byId(b.id).gone = true;
   assert.equal(s.post({ clave: KEY, accion: 'subir', ref: 'tx-bbbbbb', id: b.id, ruta, nombre: '20261124 Laura Koaj.pdf', ver: 'v1' }).error, 'noexiste');
   assert.match(s.api.doGet().text, /funcionando/);
+});
+
+test('copias restauradas: se rechazan identificadores, fechas y colores con formato raro', () => {
+  const ok = { transactions: [{ id: 'a1b2-c3', date: '2026-11-24', people: ['p-1'], accountId: '', categoryId: 'c:1' }], accounts: [{ id: 'x', color: '#2E6B52' }],
+    people: [{ id: 'p-1', name: 'Ana <b>' }], settings: { glass: { transparency: 65 }, holidayEx: { extraHolidays: ['2026-12-26'] }, passkey: { credId: '+/=' } }, wishes: [{ cond: { cuotas: 3 } }], wishFund: { start: '2026-09' } };
+  assert.deepEqual(C.unsafeStateFields(ok), []);
+  const bad = { transactions: [{ id: '"><b>', date: '24/11/2026', people: ['x"'] }], accounts: [{ id: 'x', color: 'red;background:url(x)' }], settings: { glass: { blur: '3"' } }, wishes: [{ cond: { cuotas: '1" onfocus=x' } }] };
+  assert.deepEqual(C.unsafeStateFields(bad), ['copia.transactions[0].id', 'copia.transactions[0].date', 'copia.transactions[0].people', 'copia.accounts[0].color', 'copia.settings.glass.blur', 'copia.wishes[0].cond.cuotas']);
+  assert.deepEqual(C.unsafeStateFields(null), ['copia']);
 });

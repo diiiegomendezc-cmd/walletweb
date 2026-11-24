@@ -40,6 +40,11 @@ Antes de cambiar algo grande, lee `PROJECT_STATUS.md` (decisiones y límites) y 
 - Si cambias el programa de Apps Script (`DRIVE_GS` en core.js), sube `DRIVE_SCRIPT_VERSION`: la app le pide al usuario copiarlo
   de nuevo y publicarlo como versión nueva (Implementar → Gestionar implementaciones → Editar → Versión nueva, misma URL).
 - Sin dependencias nuevas ni build. Si algo necesita backend, anotarlo en `PROJECT_STATUS.md`.
+- **El repositorio es público**: nunca subir datos personales (correos, nombres reales, fotos o textos de facturas reales, números de
+  documento, direcciones). Pruebas y ejemplos con datos ficticios. Si algo se filtra, quitarlo también del historial.
+- Seguridad: todo texto del usuario va con `esc()` al HTML; ids, fechas, colores y números internos se insertan sin escapar y por
+  eso las copias restauradas se revisan con `C.unsafeStateFields`. Nada de `onclick` en línea (la CSP lo bloquea): usar `data-act`.
+  En Demostración no se tocan otros perfiles.
 
 ## Al entregar una versión
 1. Subir `VERSION` en `sw.js` y `APP_VERSION` en `app-base.js` (mismo número).
