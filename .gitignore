@@ -17,3 +17,6 @@ tools/drivelab/out/
 *.csv
 walletweb-copia-*.json
 *.zip
+
+# Laboratorio del escáner: salidas de detección
+tools/scanlab/out_det/

@@ -219,7 +219,12 @@ function ocrStatusHTML() {
     ${sug.length ? `<div class="chips wrap" style="margin-top:8px">${sug.join('')}</div>` : ''}<div class="tiny muted" style="margin-top:6px">Los campos marcados “de la foto” se pueden corregir.</div>`;
 }
 // "ARTURO CALLE" → "Arturo Calle"; siglas cortas (D1, KOAJ) se dejan tal cual
-function niceName(s) { s = String(s || '').trim(); return s.split(/\s+/).map(w => w.length <= 4 && /^[A-Z0-9&.]+$/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ').slice(0, 60); }
+function niceName(s) {
+  s = String(s || '').trim();
+  const SMALL = /^(DE|DEL|Y|E|EN|LA|LAS|EL|LOS|SAN|SANTA)$/; // palabras comunes: no son siglas
+  return s.split(/\s+/).map((w, i) => SMALL.test(w) ? (i && /^(DE|DEL|Y|E|EN)$/.test(w) ? w.toLowerCase() : w.charAt(0) + w.slice(1).toLowerCase())
+    : w.length <= 4 && /^[A-Z0-9&.]+$/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ').slice(0, 60);
+}
 function receiptItems(items) { return items.map(i => ({ name: i.name.charAt(0) + i.name.slice(1).toLowerCase(), qty: String(i.qty || 1), unit: Math.round(i.amount / (i.qty || 1)).toLocaleString('es-CO') })); }
 function itemsText(items) { return items.map(i => `${i.qty > 1 ? i.qty + ' × ' : ''}${i.name.charAt(0) + i.name.slice(1).toLowerCase()} — ${C.formatMoney(i.amount)}`).join('\n'); }
 // Llena solo los campos vacíos; lo que ya escribiste no se toca
@@ -229,7 +234,11 @@ function applyReceiptData(r, source) {
   for (const k of ['tax', 'tip', 'discount', 'shipping']) if (r[k] && !String(D[k] || '').trim()) { D[k] = fmt(r[k]); D.ocrFilled[k] = true; if (!D.rows.includes(k)) D.rows = EXTRA_ROWS.map(x => x[0]).filter(x => D.rows.includes(x) || x === k); }
   if (r.total && !C.evalAmount(D.amountText)) { D.amountText = fmt(r.total); D.ocrFilled.amount = true; }
   if (r.items.length && !D.items.some(it => String(it.name).trim())) { D.items = receiptItems(r.items); D.ocrFilled.items = true; }
-  if (r.merchant && !String(D.merchant || '').trim() && D.type === 'expense') { D.merchant = niceName(r.merchant); D.ocrFilled.merchant = true; }
+  if (r.merchant && !String(D.merchant || '').trim() && D.type === 'expense') {
+    // si ya compraste ahí, se usa el nombre como lo escribiste tú (el lector a veces cambia una letra)
+    const known = [...new Set(S.transactions.filter(t => !t.deletedAt && t.merchant).map(t => t.merchant))];
+    D.merchant = C.matchMerchant(r.merchant, known) || niceName(r.merchant); D.ocrFilled.merchant = true;
+  }
   if (r.date && D.date === today() && !D.id && r.date <= today() && C.diffDays(r.date, today()) <= 400) { D.date = r.date; D.ocrFilled.date = true; }
   D.ocr = { state: 'done', r, source };
   D.more = true;

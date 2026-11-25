@@ -76,18 +76,22 @@ def main():
         found = sum(1 for t in gt_tok if (t in ocr_tok) or (t[0].isdigit() and digits(t) in ocr_dig))
         recall = found / max(1, len(gt_tok))
         F = meta['fields']; P = r.get(os.environ.get('VAR', 'parsed')) or {}
-        total_line_vis = any(v and 'TOTAL :' in l for l, v in zip(meta['lines'], meta['visible']))
-        tax_line_vis = any(v and l.startswith('Iva 19%') for l, v in zip(meta['lines'], meta['visible']))
+        if 'total_line' in meta:  # fotos de gen_mix.py: la línea del total y la del IVA vienen marcadas
+            total_line_vis = meta['visible'][meta['total_line']]
+            tax_line_vis = meta['tax_line'] is not None and meta['visible'][meta['tax_line']]
+        else:
+            total_line_vis = any(v and 'TOTAL :' in l for l, v in zip(meta['lines'], meta['visible']))
+            tax_line_vis = any(v and l.startswith('Iva 19%') for l, v in zip(meta['lines'], meta['visible']))
         tot_ok = (P.get('total') == F['total']) if total_line_vis else None
         tax_ok = (P.get('tax') == F['tax']) if tax_line_vis else None
         date_ok = P.get('date') == F['date']
-        merch = norm(P.get('merchant') or '')
-        merch_ok = bool(merch) and norm(F['merchant']) in merch
+        merch = norm(P.get('merchant') or '').replace(' ', '')
+        merch_ok = bool(merch) and norm(F['merchant']).replace(' ', '') in merch
         gi = sorted(i['amount'] for i in F['items']); pi = [i['amount'] for i in P.get('items', [])]
         items_ok = sum(1 for a in gi if a in pi) / max(1, len(gi))
         items_extra = max(0, len(pi) - len(gi))
         ok = io >= 0.85 and jr <= 0.015 and recall >= 0.85 and (tot_ok is not False)
-        rows.append(dict(name=name, bg=meta['bg'], hand=meta['hand'], iou=io, junk=jr, recall=recall, tot=tot_ok, tax=tax_ok, date=date_ok, merch=merch_ok, items=items_ok, extra=items_extra, ok=ok, conf=r.get('conf'), ms=r.get('msDetect', 0) + r.get('msProcess', 0)))
+        rows.append(dict(name=name, kind=meta.get('kind', 'store'), bg=meta['bg'], hand=meta['hand'], iou=io, junk=jr, recall=recall, tot=tot_ok, tax=tax_ok, date=date_ok, merch=merch_ok, items=items_ok, extra=items_extra, ok=ok, conf=r.get('conf'), ms=r.get('msDetect', 0) + r.get('msProcess', 0)))
     if not rows: print('sin resultados'); return
     fmt = lambda b: '—' if b is None else ('sí' if b else 'NO')
     print(f"{'foto':9} {'fondo':11} {'IoU':>5} {'basura':>6} {'texto':>6} {'total':>5} {'iva':>4} {'fecha':>5} {'tienda':>6} {'ítems':>6} {'ms':>5}  ok")
@@ -97,7 +101,15 @@ def main():
     def pct(k, cond=lambda v: v): vals = [x[k] for x in rows if x[k] is not None]; return 100 * sum(1 for v in vals if cond(v)) / max(1, len(vals))
     print(f"\nRESUMEN ({n} fotos): ÉXITO {100*sum(x['ok'] for x in rows)/n:.0f}%  |  recorte IoU≥0.85 {pct('iou', lambda v: v >= 0.85):.0f}%  |  sin basura {pct('junk', lambda v: v <= 0.015):.0f}%  |  texto≥85% {pct('recall', lambda v: v >= 0.85):.0f}%")
     print(f"auto-llenado: total {pct('tot'):.0f}%  iva {pct('tax'):.0f}%  fecha {pct('date'):.0f}%  tienda {pct('merch'):.0f}%  ítems(prom) {100*np.mean([x['items'] for x in rows]):.0f}%  ítems sobrantes(prom) {np.mean([x['extra'] for x in rows]):.1f}")
+    full = [x for x in rows if x['tot'] is not None]
+    print(f"datos completos (total + fecha + tienda correctos, con el total a la vista): {100*np.mean([bool(x['tot'] and x['date'] and x['merch']) for x in full]) if full else 0:.0f}%  ({len(full)} fotos)")
     print(f"tiempo medio detección+limpieza {np.mean([x['ms'] for x in rows]):.0f} ms")
+    kinds = sorted(set(x['kind'] for x in rows))
+    if len(kinds) > 1:
+        for k in kinds:
+            rs = [x for x in rows if x['kind'] == k]
+            tv = [x['tot'] for x in rs if x['tot'] is not None]
+            print(f"  {k:8} {len(rs):3d} fotos  éxito {100*sum(x['ok'] for x in rs)/len(rs):3.0f}%  recorte {100*np.mean([x['iou']>=0.85 for x in rs]):3.0f}%  limpio {100*np.mean([x['junk']<=0.015 for x in rs]):3.0f}%  texto {100*np.mean([x['recall']>=0.85 for x in rs]):3.0f}%  total {100*np.mean(tv) if tv else 0:3.0f}%  fecha {100*np.mean([x['date'] for x in rs]):3.0f}%  tienda {100*np.mean([x['merch'] for x in rs]):3.0f}%")
 
 
 if __name__ == '__main__':

@@ -420,17 +420,20 @@
   // (códigos como S04E-31877 o 1_FAC).
   function amountTokens(line) {
     const re = /[-–]?\$?\s?\d[\d.,]*/g, out = []; let m;
+    // fechas completas (2026-11-24, 24-11-26, 24.11.2026) no son montos: se tapan conservando las posiciones
+    line = String(line).replace(/(^|[^\d.,])(\d{4}[-\/.]\d{1,2}[-\/.]\d{1,2}|\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4})(?![\d.,]*\d)/g, (all, pre, dt) => pre + ' '.repeat(dt.length));
     while ((m = re.exec(line))) {
       const raw = m[0], lead = raw.search(/\d/), ds = m.index + lead;
       let de = m.index + raw.length; while (de > ds && /[.,]/.test(line[de - 1])) de--;
       const before = line[m.index - 1] || ' ', bd = line[ds - 1] || ' ', after = line[de] || ' ';
       if (/[A-Za-zÁÉÍÓÚÑáéíóúñ_]/.test(before) && !/^\s/.test(raw)) continue;       // pegado a letras: código
-      if (/[\/:]/.test(bd) && !/\s/.test(raw.slice(0, lead)) || /[\/:]/.test(after)) continue; // fechas y horas (10/05/26, 13:40)
+      if ((bd === '/' || (bd === ':' && /^\d{1,2}$/.test(line.slice(ds, de)))) && !/\s/.test(raw.slice(0, lead)) || /[\/:]/.test(after)) continue; // fechas y horas (10/05/26, 13:40)
       if (/^\s?%/.test(line.slice(de, de + 2))) continue;                            // porcentajes (19 %)
       if (/[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(after) && !/[xX×]/.test(after)) continue;     // 1KG, 500MG, 4X
-      const tok = line.slice(ds, de), v = parseAmountToken(tok);
+      const tok = line.slice(ds, de), v = parseAmountToken(tok), sep = /\d[.,]\d{3}(?!\d)/.test(tok);
       if (v === null) continue;
-      out.push({ value: v, index: m.index, end: de, raw: tok, sep: /\d[.,]\d{3}(?!\d)/.test(tok), negative: /^[-–]/.test(raw.trim()) && /[\s$(]/.test(before) });
+      if (!sep && tok.replace(/\D/g, '').length >= 8) continue;                         // cédula, placa, teléfono, código
+      out.push({ value: v, index: m.index, end: de, raw: tok, sep, negative: /^[-–]/.test(raw.trim()) && /[\s$(]/.test(before) });
     }
     return out;
   }
@@ -438,11 +441,22 @@
   function plain(s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); }
   const LETTERS = /[A-Za-zÁÉÍÓÚÑáéíóúñ]/g;
   const nLetters = s => (String(s).match(LETTERS) || []).length;
-  // Nombre de la tienda: "TIENDA KOAJ PLAZA NORTE" → KOAJ; razón social (LTDA, S.A.S.) seguida de la marca → la marca
+  // Distancia de edición (para comparar el logo leído con la razón social)
+  function editDistance(a, b) {
+    const m = a.length, n = b.length; if (!m || !n) return m + n;
+    let prev = Array.from({ length: n + 1 }, (_, j) => j);
+    for (let i = 1; i <= m; i++) { const cur = [i]; for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = cur; }
+    return prev[n];
+  }
+  // Nombre de la tienda: "TIENDA KOAJ PLAZA NORTE" → KOAJ; razón social (LTDA, S.A.S.) seguida de la marca → la marca;
+  // logo con letras separadas ("B R A V O") → BRAVO; parqueadero de un centro comercial → "CC <nombre>"
   function receiptMerchant(lines) {
     const ADDR = /\b(calle|cll|cl|carrera|cra|kr|avenida|av|diagonal|dg|transversal|tv|centro|cc|c\.c|local|piso|barrio|no|km)\b|#|\d/;
-    const SKIPM = /(nit|tel|ciudad|caja|factura|fecha|hora|cliente|vendedor|consecutivo|regimen|resoluci|iva|responsable|codigo|descripcion|direcci|www|\.com|cajero|turno)/;
-    const SUFFIX = /\b(ltda|limitada|s\.?\s?a\.?\s?s|s\.?a\.?|sas|e\.?u\.?|& cia|y cia)\b\.?/;
+    const SKIPM = /(nit|tel|ciudad|caja|factura|fecha|hora|cliente|vendedor|consecutivo|regimen|resoluci|iva|responsable|codigo|descripcion|direcci|www|\.com|cajero|turno|sede|principal|sucursal|security|access|entidad|animo|lucro|comprobante|documento|equivalente|ticket|bienvenid|gracias|copia|original|propiedad horizontal|contribuyente|punto|concepto|parqueo|unid|valor|total|dto\b|cant\b)/;
+    const SUFFIX = /\b(ltda|limitada|s\.?\s?a\.?\s?s|s\.?a\.?|sas|e\.?u\.?|& cia|y cia|p\.?\s?h)\b\.?/;
+    const GENERIC = /^(cueros|calzados?|calz|moda|modas|accesorios|inversiones|comercializadora|distribuidora|distribuciones|almacenes|almacen|grupo|tiendas|supermercados?|droguerias?|restaurantes?|panaderias?|ferreterias?|confecciones|industrias|productos|operadora|corporacion|sociedad|compania|importadora|textiles)\s+/i;
+    const SPACED = /^(?:[A-Za-zÁÉÍÓÚÑáéíóúñ]{1,2}\s+){2,}[A-Za-zÁÉÍÓÚÑáéíóúñ]{1,2}$/;
+    const noSuffix = x => x.replace(new RegExp('\\s*' + SUFFIX.source + '.*$', 'i'), '').trim();
     const cands = [], top = lines.slice(0, 12).map(l => l.replace(/€/g, '&'));
     for (let k = 0; k < top.length; k++) {
       const l = top[k], low = plain(l);
@@ -454,18 +468,55 @@
         if (full || brand) return full || brand;
       }
       if (SKIPM.test(low) || nLetters(l) < 3 || (l.match(/\d/g) || []).length > 4) continue;
-      if (lastAmount(l)) continue;
-      cands.push(l.replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9&]+|[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9.&)]+$/g, '').trim());
-      if (cands.length >= 4) break;
+      const la = lastAmount(l); if (la && la.value >= 100) continue;
+      let c = l.replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ&]+|[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9.&)]+$/g, '').trim(); // sin basura ni números sueltos al inicio
+      const logo = SPACED.test(c); if (logo) c = c.replace(/\s+/g, '').toUpperCase();
+      if (!logo && nLetters(c) < 3) continue;
+      const pc = plain(c).replace(/[^a-z ]/g, '');
+      if (editDistance(pc.replace(/\s+/g, ''), 'securityaccess') <= 5 || editDistance(pc.trim(), 'edificio') <= 2) continue; // marca del sistema del parqueadero
+      // los nombres de tienda vienen en mayúsculas; "via", "pea" o "ces" son letras sueltas mal leídas
+      const up = (c.match(/[A-ZÁÉÍÓÚÑ]/g) || []).length; if (!logo && up < nLetters(c) * 0.6) continue;
+      cands.push({ t: c, logo, li: k });
+      if (cands.length >= 5) break;
     }
     if (!cands.length) return null;
-    const first = cands[0];
-    if (SUFFIX.test(plain(first))) {
-      const brand = cands.slice(1, 3).find(c => !SUFFIX.test(plain(c)) && c.split(/\s+/).length <= 3 && !/\d/.test(c));
-      if (brand) return brand;
-      return first.replace(new RegExp(SUFFIX.source + '.*$', 'i'), '').trim() || first;
+    // Parqueadero: "EDIFICIO CENTRO COMERCIAL LAS PALMAS P.H." (a veces partido en dos renglones)
+    for (let k = 0; k < Math.min(3, cands.length); k++) {
+      let m = /centro\s+comerc[a-z]*\.?\s*(.*)$/i.exec(cands[k].t);
+      if (!m) { // "CETRO CQECIA LAS PALNAS PH", "EDIFICI MERCIAL ...": palabras mal leídas pero parecidas
+        const ws = cands[k].t.split(/\s+/);
+        for (let i = 0; i < ws.length && !m; i++) {
+          const w1 = plain(ws[i]).replace(/[^a-z]/g, ''), w2 = plain(ws[i + 1] || '').replace(/[^a-z]/g, '');
+          const isCom = x => x.length >= 3 && (editDistance(x, 'comercial') <= 3 || 'comercial'.startsWith(x) || (x.length >= 4 && 'comercial'.endsWith(x)));
+          if (editDistance(w1, 'centro') <= 2 && (isCom(w2) || editDistance(w2, 'comercial') <= 4)) m = [null, ws.slice(i + 2).join(' ')];
+          else if (w1.length >= 5 && isCom(w1)) m = [null, ws.slice(i + 1).join(' ')];
+        }
+      }
+      if (!m) continue;
+      let name = noSuffix(m[1]).replace(/[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9&\s.]/g, '').trim();
+      const nx = cands[k + 1]; // nombre en el renglón siguiente ("EDIFICIO CENTRO COMERCIAL" / "LAS PALMAS P.H.")
+      if (!name && nx && !nx.logo && nx.li - cands[k].li <= 2) name = noSuffix(nx.t).replace(/[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9&\s.]/g, '').trim();
+      if (name) return 'CC ' + name;
     }
-    return first;
+    const first = cands[0];
+    if (first.logo) {
+      // El logo se lee mal con facilidad: si la razón social trae una palabra parecida, esa es la marca
+      const legal = cands.slice(1, 4).find(c => !c.logo && SUFFIX.test(plain(c.t)));
+      if (legal) {
+        let best = null, bd = 1e9;
+        for (const wd of noSuffix(legal.t).split(/\s+/)) { if (nLetters(wd) < 3) continue; const d = editDistance(plain(wd), plain(first.t)); if (d < bd) { bd = d; best = wd; } }
+        if (best && bd <= Math.max(2, Math.ceil(best.length * 0.6))) return best;
+      }
+      if (first.t.length >= 3) return first.t;
+    }
+    const c0 = cands.find(c => !c.logo) || first;
+    if (SUFFIX.test(plain(c0.t))) {
+      const brand = cands.slice(cands.indexOf(c0) + 1, cands.indexOf(c0) + 3).find(c => !c.logo && c.li - c0.li <= 3 && !SUFFIX.test(plain(c.t)) && c.t.split(/\s+/).length <= 3 && !/\d/.test(c.t));
+      if (brand) return brand.t;
+      const s0 = noSuffix(c0.t);
+      return s0.replace(GENERIC, '').trim() || s0 || c0.t;
+    }
+    return c0.t;
   }
   function receiptLinesFromWords(words) {
     const ws = (words || []).filter(w => w && w.text && w.text.trim() && w.bbox).map(w => ({ t: w.text.trim(), x0: w.bbox.x0, x1: w.bbox.x1, yc: (w.bbox.y0 + w.bbox.y1) / 2, h: w.bbox.y1 - w.bbox.y0 }));
@@ -486,21 +537,73 @@
     if (!a) return b; if (!b) return a;
     const sumIt = r => r.items.reduce((s, i) => s + i.amount, 0) + (r.tip || 0) + (r.shipping || 0) - (r.discount || 0);
     const votes = new Map(), add = (v, w) => { if (v) votes.set(v, (votes.get(v) || 0) + w); };
-    add(a.total, a.totalSource === 'sum' ? 0.5 : 2); add(b.total, b.totalSource === 'sum' ? 0.5 : 2); add(sumIt(a), 0.75); add(sumIt(b), 0.75);
+    // se suman los votos de las dos lecturas (un total leído en una y confirmado por la base + IVA en la otra gana)
+    if (a._cand && b._cand) { for (const [v, w] of a._cand) add(v, w); for (const [v, w] of b._cand) add(v, w); }
+    else { add(a.total, a.totalSource === 'sum' ? 0.5 : 2); add(b.total, b.totalSource === 'sum' ? 0.5 : 2); }
+    add(sumIt(a), 0.75); add(sumIt(b), 0.75);
     if (a.subtotal && a.tax) add(a.subtotal + a.tax, 1); if (b.subtotal && b.tax) add(b.subtotal + b.tax, 1);
     let total = a.total || b.total, bw = 0; for (const [v, w] of votes) if (w > bw || (w === bw && v === a.total)) { bw = w; total = v; }
+    { const cs = amountConsensus([...votes]); if (cs.value && cs.weight > bw + 0.5) { total = cs.value; bw = cs.weight; } }
     const okTax = (t, s) => t && total && (Math.abs(t - (total - Math.round(total / 1.19))) <= 2 || (s && Math.abs(total - s - t) <= 2));
     const tax = okTax(a.tax, a.subtotal) ? a.tax : okTax(b.tax, b.subtotal) ? b.tax : (a.tax || b.tax);
     const okSub = s => s && total && s <= total && s >= total * 0.5;
     const subtotal = okSub(a.subtotal) ? a.subtotal : okSub(b.subtotal) ? b.subtotal : (a.subtotal || b.subtotal);
     const fits = r => r.items.length && Math.abs(sumIt(r) - total) <= 1;
     const items = fits(a) ? a.items : fits(b) ? b.items : (b.items.length > a.items.length ? b.items : a.items);
-    return Object.assign({}, a, { total, tax, subtotal, items, date: a.date || b.date, merchant: a.merchant || b.merchant, nit: a.nit || b.nit, tip: a.tip ?? b.tip, discount: a.discount ?? b.discount, shipping: a.shipping ?? b.shipping });
+    // tienda: si una lectura es parte de la otra ("GALEANO" / "CALZ GALEANO"), la más corta es la marca
+    let merchant = a.merchant || b.merchant;
+    if (a.merchant && b.merchant && a.merchant !== b.merchant) {
+      const pa = plain(a.merchant).replace(/\s+/g, ' '), pb = plain(b.merchant).replace(/\s+/g, ' ');
+      const words = x => x.split(/[^a-z0-9&]+/).filter(Boolean), wa = words(pa), wb = words(pb);
+      // solo si una tiene todas las palabras completas de la otra ("CALZ GALEANO" ⊃ "GALEANO", no "QUINTERO" ⊃ "UINTERO")
+      if (wb.length && wb.every(x => wa.includes(x)) && nLetters(pb) >= 4) merchant = b.merchant;
+      else if (wa.length && wa.every(x => wb.includes(x)) && nLetters(pa) >= 4) merchant = a.merchant;
+    }
+    return Object.assign({}, a, { total, tax, subtotal, items, date: a.date || b.date, merchant, nit: a.nit || b.nit, tip: a.tip ?? b.tip, discount: a.discount ?? b.discount, shipping: a.shipping ?? b.shipping });
+  }
+  // Montos casi iguales leídos de varias formas (389.004, 389.314, 389.264, 389.064): se vota cifra por cifra.
+  // Solo junta montos de 4+ cifras, del mismo largo, con a lo sumo 2 cifras distintas y menos de 1 % de diferencia.
+  function amountConsensus(scored) {
+    const list = scored.filter(([v, w]) => v > 0 && w > 0).sort((a, b) => b[1] - a[1]);
+    let best = null, bw = 0;
+    for (const [seed] of list) {
+      const ss = String(seed), group = list.filter(([v]) => {
+        const sv = String(v); if (sv.length !== ss.length) return false;
+        if (v === seed) return true;
+        if (ss.length < 4 || Math.abs(v - seed) > seed * 0.01) return false;
+        let d = 0; for (let k = 0; k < ss.length; k++) if (sv[k] !== ss[k]) d++;
+        return d <= 2;
+      });
+      const wsum = group.reduce((t, g) => t + g[1], 0);
+      let digits = '';
+      for (let k = 0; k < ss.length; k++) {
+        const tally = new Map(); for (const [v, w] of group) { const ch = String(v)[k]; tally.set(ch, (tally.get(ch) || 0) + w); }
+        let bc = ss[k], bt = -1; for (const [ch, t] of tally) if (t > bt || (t === bt && ch === ss[k])) { bt = t; bc = ch; }
+        digits += bc;
+      }
+      if (wsum > bw + 1e-9) { bw = wsum; best = Number(digits); }
+    }
+    return { value: best, weight: bw };
+  }
+  // Tienda leída de una factura → la misma tienda que ya usaste, aunque el lector cambie una o dos letras
+  // ("CC LAS PALNAS" → "CC Las Palmas"). Si una contiene a la otra ("BRAVO" / "Bravo Plaza Central"), la más reciente.
+  function matchMerchant(name, known) {
+    const key = x => plain(x).replace(/[^a-z0-9]/g, ''), k = key(name);
+    if (k.length < 3) return null;
+    let best = null, bd = 1e9, cont = null;
+    for (const m of known || []) {
+      const km = key(m); if (!km) continue;
+      if (km === k) return m;
+      const d = editDistance(k, km), lim = Math.min(3, Math.floor(Math.max(k.length, km.length) * 0.2));
+      if (d <= lim && d < bd) { bd = d; best = m; }
+      if (k.length >= 4 && km.length >= 4 && (km.startsWith(k) || k.startsWith(km))) cont = m; // la lista va de más vieja a más reciente
+    }
+    return best || cont;
   }
   function parseReceiptText(text) {
-    const lines = String(text || '').split(/\r?\n/).map(l => l.replace(/[—–]+/g, ' ').replace(/[|“”"¦]/g, ' ').replace(/\s+/g, ' ').replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9$-]+/, '').trim()).filter(Boolean);
+    const lines = String(text || '').split(/\r?\n/).map(l => l.replace(/[—–]+/g, ' ').replace(/[|“”"¦]/g, ' ').replace(/\s+/g, ' ').replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9$*-]+/, '').trim()).filter(Boolean);
     // Montos impresos medio renglón más arriba o más abajo que su etiqueta ("6280" / "Iva 19%"): se unen
-    const KV = /(sub\s*-?\s*t[o0]ta[l1]|t[o0]ta[l1]|\b[il1!]?va\b|impoconsumo|impuesto|propina|descuento|domicilio|cambio|efectivo|\btef\b|\bcred|\bdeb)/;
+    const KV = /(sub\s*-?\s*t[o0]ta[l1]|t[o0]ta[l1]|\b[il1!]?va\b|impoconsumo|impuesto|propina|descuento|domicilio|cambio|efectivo|recibid|\btef\b|\bcred|\bdeb)/;
     for (let j = 0; j < lines.length; j++) {
       const l = lines[j]; if (nLetters(l) > 1) continue;
       const tk = amountTokens(l); if (tk.length !== 1) continue;
@@ -509,31 +612,86 @@
       if (to >= 0) { lines[to] = lines[to] + ' ' + tk[0].raw; lines.splice(j, 1); j--; }
     }
     const r = { items: [], subtotal: null, tax: null, tip: null, discount: null, shipping: null, total: null, nit: null, date: null, merchant: null };
-    let taxSum = 0, tipSum = 0, discSum = 0, shipSum = 0, totalPay = null, total = null, totalRow = null, payCard = null;
-    const SKIP = /(cambio|efectivo|recibido|tarjeta|debito|\bdeb\b|credito|\bcred\b|\btef\b|visa|master|nequi|daviplata|vueltas|pago|cuotas|aprobaci|autoriz|redondeo|\bbase\b|exent|excluid|gravad|bruto|\bneto\b|saldo|puntos|tel[eé]?f|telefono|\btel\b|fecha|hora|\bcaja\b|cajero|factura|resoluci|\bres\b|decreto|autorreten|retenedor|\bnit\b|consecutivo|vendedor|cliente|ciudad|\bcalle\b|carrera|\bcra\b|direcci|\bpiso\b|codigo|descripcion|\bunid|t\.unid|medio de|\bitems?\b|articulos|cantidad|\bcant\b)/;
+    let taxSum = 0, tipSum = 0, discSum = 0, shipSum = 0, totalPay = null, total = null, totalRow = null, payCard = null, bigTotal = null, bigW = 0, paid = 0, change = 0;
+    let minutes = null, rate = null, rateNext = false, baseV = null, has19 = false, looseTotal = null; const looseAlts = [];
+    const SKIP = /(cambio|efect|recibido|tarjeta|debito|\bdeb\b|credito|\bcred\b|\btef\b|visa|master|nequi|daviplata|vueltas|pago(?!\s*en\s*tienda|tienda)|cuotas|aprobaci|autoriz|redondeo|\bbase\b|exent|excluid|gravad|bruto|\bneto\b|saldo|puntos|tel[eé]?f|telefono|\btel\b|fecha|hora|\bcaja\b|cajero|factura|resoluci|\bres\b|decreto|autorreten|retenedor|\bnit\b|consecutivo|vendedor|cliente|ciudad|\bcalle\b|carrera|\bcra\b|direcci|\bpiso\b|codigo|descripcion|\bunid|t\.unid|medio de|\bitems?\b|articulos|cantidad|\bcant\b|documento|cedula|placa|poliza|ticket|minuto|tarifa|tiempo|entrada|salida|valor por|punto fact|\bapro|\bnum\b|seguro|aseguradora|multiplo|aproxima|\bdian\b|\b[il]an\s?no\b|resol|p\W?[o0ós]l[il1]za)/;
+    const ADDRL = /(^|\s)(av|avenida|cl|cll|calle|kr|cra|carrera|dg|diagonal|tv|transversal)\.?\s+\d|#\s?\d+\s?[a-z]?\s?-\s?\d+|\d{1,3}\s?-\s?\d{2}\b.*\b(cc|c\.c|lc|local|estacion|centro comercial|piso)\b/;
+    // Fechas: cada una vota (con "Fecha" vale más); un dígito mal leído (73/11/26, 2076) se corrige si cuadra
+    const thisYear = new Date().getFullYear(), dateVotes = new Map();
+    const CONF = { 7: '21', 1: '7', 2: '7', 0: '869', 6: '08', 8: '06', 9: '0', 5: '6', 3: '8', 4: '1' };
+    const okDate = (y, mo, dd) => y >= 2000 && y <= thisYear + 1 && mo >= 1 && mo <= 12 && dd >= 1 && dd <= daysInMonth(y, mo);
+    const voteDate = (ys, ms, ds, wgt) => {
+      const Y = s => { let y = Number(s); return y < 100 ? y + 2000 : y; };
+      if (okDate(Y(ys), +ms, +ds)) { const k = iso(Y(ys), +ms, +ds); dateVotes.set(k, (dateVotes.get(k) || 0) + wgt); return; }
+      const parts = [ys, ms, ds];
+      for (let p = 0; p < 3; p++) for (let k = 0; k < parts[p].length; k++) for (const alt of (CONF[parts[p][k]] || '')) {
+        const q = parts.slice(); q[p] = q[p].slice(0, k) + alt + q[p].slice(k + 1);
+        const y = Y(q[0]); if (!okDate(y, +q[1], +q[2])) continue;
+        const key = iso(y, +q[1], +q[2]); dateVotes.set(key, (dateVotes.get(key) || 0) + wgt * 0.3 * Math.max(0.05, 1 - Math.abs(thisYear - y) * 0.15));
+      }
+    };
     const TAXW = /(\b[il1!|]?va\b|i\.v\.a|impoconsumo|imp\.?\s*consumo|\binc\b|impuesto|\bico\b)/;
     const isHeader = low => /(cant|precio|valor|total|descripcion|codigo|dto|dcto)/.test(low) && !lastAmount(low);
     let pendingQty = null;
     for (let li = 0; li < lines.length; li++) {
       const line = lines[li], low = plain(line);
       const nit = /nit[\s.:#-]*([\d.]{6,}[\s-]*\d?)/.exec(low); if (nit && !r.nit && li < 8) r.nit = nit[1].replace(/\s/g, '');
-      const d = /(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})(?!\d)/.exec(line);
-      if (d && (!r.date || /fecha/.test(low))) { let y = Number(d[3]); if (y < 100) y += 2000; const mo = Number(d[2]), dd = Number(d[1]); if (y >= 2000 && y < 2100 && mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31 && (!r.date || /fecha/.test(low))) r.date = iso(y, mo, dd); }
+      {
+        const wd = /fecha/.test(low) || (li > 0 && /fecha/.test(plain(lines[li - 1])) && !/fecha/.test(low)) ? 2.5 : /venc|limite|hasta/.test(low) ? 0.3 : 1;
+        let dm; const reI = /(?:^|[^\d])(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?!\d)/g, reD = /(?:^|[^\d.,])(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})(?![\d.,]*\d)/g;
+        while ((dm = reI.exec(line))) voteDate(dm[1], dm[2], dm[3], wd + 0.2);
+        while ((dm = reD.exec(line))) voteDate(dm[3], dm[2], dm[1], wd);
+        // "02/12 26" o "02/12 2026": el lector cambió el último separador por un espacio
+        const reS = /(?:^|[^\d.,\/])(\d{1,2})[\/\-](\d{1,2})\s(\d{4}|\d{2})(?![\d.,:\/]*\d)/g;
+        while ((dm = reS.exec(line))) voteDate(dm[3], dm[2], dm[1], wd * 0.6);
+        const MES = /(\d{1,2})\s*(?:de\s+)?(ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic)[a-z]*\.?\s*(?:de\s+|del\s+)?(\d{4}|\d{2})(?!\d)/.exec(low);
+        if (MES) voteDate(MES[3], String('enefebmarabrmayjunjulagosepoctnovdic'.indexOf(MES[2] === 'set' ? 'sep' : MES[2]) / 3 + 1), MES[1], wd);
+      }
       const toks = amountTokens(line), a = toks[toks.length - 1];
       // Fila de totales bajo un encabezado "... TOTAL" (ej.: "4 39.330 0 39.330")
       if (li > 0 && /t[o0]ta[l1i]/.test(plain(lines[li - 1])) && isHeader(plain(lines[li - 1])) && a && nLetters(line) < 3) { totalRow = a.value; continue; }
+      // Parqueaderos: minutos × valor por minuto (redondeado a múltiplos de $50) es otra forma de saber el total
+      { const mi = /(\d{1,4})\s*minut/.exec(low); if (mi && !/valor|por minut/.test(low)) minutes = Number(mi[1]);
+        const ti = /tiempo\D{0,6}(\d{1,2}):(\d{2})(?!:)/.exec(low); if (ti && minutes === null) minutes = Number(ti[1]) * 60 + Number(ti[2]);
+        if (/valor\s*por\s*minut|por\s*minuto/.test(low)) { if (a && a.value >= 20 && a.value < 2000) rate = a.value; else rateNext = true; }
+        else if (rateNext) { rateNext = false; const t0 = toks.find(t => t.value >= 20 && t.value < 2000); if (t0 && nLetters(line) <= 8) rate = t0.value; } }
+      // Renglón del total con basura pegada ("TOTAL A PAGAR ===> 7at-200,00/"): se busca un monto bien formado
+      if ((/t[o0]ta[l1i]/.test(low) || /\ba\s?pagar\b/.test(low)) && !/sub/.test(low) && !/(iva|impuesto|items|unidades|articulos|unid)/.test(low)) {
+        const mm = line.match(/\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{2})?(?!\d)|\d+[.,]\d{2}(?![\d.,]*\d)/g);
+        const lv = mm ? parseAmountToken(mm[mm.length - 1]) : null;
+        if (lv && (!a || (!a.sep && lv !== a.value && lv > a.value))) {
+          const raw = mm[mm.length - 1], intPart = raw.replace(/[.,]\d{2}$/, '');
+          if (/^\d{4,}$/.test(intPart)) {
+            // "72200,00" sin separador de miles: puede traer basura pegada adelante ("72" + "200,00")
+            for (let k = 1; k < intPart.length; k++) { const alt = Number(intPart.slice(k)); if (alt >= 100) looseAlts.push(alt); }
+            looseTotal = lv;
+          } else if (/a\s?pagar|neto|factura|valor total|vr\.? ?total|total\s*:/.test(low)) totalPay = lv; else total = lv;
+          continue;
+        }
+      }
       if (!a || a.value === 0) { const q = /^(\d{1,3})\s*[xX×*]\s*$/.exec(line); if (q) pendingQty = Number(q[1]); continue; }
       const v = a.value;
-      if (/sub\s*-?\s*t[o0]ta[l1]/.test(low)) { r.subtotal = v; continue; }
+      if ((/\bbase\b/.test(low) || /\b[b8]?ase\s+servic/.test(low)) && !/(excluid|exent|no gravad)/.test(low) && v >= 100) baseV = v;
+      if (/\b19([.,x]0{1,2})?\s?%/.test(low)) has19 = true;
+      if (toks.length === 1 && nLetters(line.replace(/[xX]/g, '')) <= 2 && /\$/.test(line) && a.sep) {
+        // "**** $ 389.000 ****": con asteriscos vale como total; sin ellos, el mayor de los montos sueltos
+        const wgt = /[*xX+%]{2,}|\*/.test(line) ? 2.5 : 1.2; if (wgt > bigW || (wgt === bigW && v > bigTotal)) { bigTotal = v; bigW = wgt; } continue;
+      }
+      // Pagos y cambio: lo pagado menos el cambio es el total
+      if (/(c[ae]?[mn]?bio\b|\bbio en\b|vueltas|devuelta)/.test(low) && !/(devoluc|garant|dias)/.test(low)) { change = Math.max(change, v); continue; }
+      if (/(efect|recibid|nota credito|tarjeta|\btef\b|\bdeb\b|debito|credito|\bcred\b|nequi|daviplata|transferencia|pagado|pago con)/.test(low) && !/(sub\s*-?\s*t[o0]tal|t[o0]ta[l1]\s*a\s*pagar)/.test(low)) {
+        const sepT = toks.filter(t => t.sep); paid = Math.max(paid, sepT.length ? Math.max(...sepT.map(t => t.value)) : v);
+      }
+      if (/sub\s*-?\s*t[o0]ta/.test(low)) { r.subtotal = v; continue; }
       if (/(propina|servicio voluntario|^servicio\b|\btip\b)/.test(low)) { tipSum += v; continue; }
       if (/(descuento|dcto|\bdesc\b|ahorro|promocion|rebaja)/.test(low)) { discSum += v; continue; }
       if (/(domicilio|\benvio\b|despacho|flete)/.test(low)) { shipSum += v; continue; }
-      if ((TAXW.test(low) || /\b(19|5|8)\s?%/.test(low)) && !/(base|excluid|exent|no gravad|antes|total|responsable|regimen)/.test(low)) { taxSum += v; continue; }
-      if (/t[o0]ta[l1i]/.test(low) && !/sub/.test(low)) { if (/a pagar|neto|factura|valor total|vr\.? ?total|total\s*:/.test(low)) totalPay = v; else if (!/(iva|impuesto|items|unidades|articulos|unid)/.test(low)) total = v; continue; }
+      if ((TAXW.test(low) || /\b(19|5|8)([.,x]0{1,2})?\s?%/.test(low)) && !/(base|ase servic|excluid|exent|no gravad|antes|total|responsable|regimen)/.test(low)) { taxSum += v; continue; }
+      if ((/t[o0]ta[l1i]/.test(low) || /\ba\s?pagar\b/.test(low)) && !/sub/.test(low)) { if (/a\s?pagar|neto|factura|valor total|vr\.? ?total|total\s*:/.test(low)) totalPay = v; else if (!/(iva|impuesto|items|unidades|articulos|unid)/.test(low)) total = v; continue; }
       // "2 x 3.500" y el producto en la línea siguiente
       const qx = /^(\d{1,3})\s*[xX×*]\s*\$?\s*[\d.,]+$/.exec(line); if (qx && nLetters(line) <= 1) { pendingQty = Number(qx[1]); continue; }
-      if (/(\btef\b|tarjeta|credito|debito|\bcred\b|\bdeb\b|visa|master|nequi|daviplata|datafono|\bpse\b|transferencia)/.test(low) && !/(cambio|cuotas)/.test(low)) payCard = v;
-      if (SKIP.test(low)) { pendingQty = null; continue; }
+      if (/(\btef\b|tarjeta|credito|debito|\bcred\b|\bdeb\b|visa|master|nequi|daviplata|datafono|\bpse\b|transferencia)/.test(low) && !/(cambio|cuotas)/.test(low)) payCard = Math.max(payCard || 0, v);
+      if (SKIP.test(low) || ADDRL.test(low)) { pendingQty = null; continue; }
       // Producto en dos líneas: nombre (con código) y debajo la fila de números "948 08 94 1 29.940 29.940"
       const next = lines[li + 1], nextToks = next ? amountTokens(next).filter(t => t.value >= 100 || t.raw.length <= 2) : [];
       const nameOnly = nLetters(line) >= 3 && (!a.sep && (a.value >= 1000 || /\d\/\d/.test(line.slice(a.index))) || /^\d{6,}/.test(line));
@@ -549,7 +707,7 @@
         li++; pendingQty = null; continue;
       }
       if (v < 100) continue; // ningún producto cuesta menos de $100: es un número de dirección, NIT o similar
-      let name = line.slice(0, a.index).replace(/^\s*\d{4,}\s*/, '').replace(/[$*]+\s*$/, '').trim();
+      let name = line.slice(0, a.index).replace(/^\s*\d{4,}\s*/, '').replace(/\[[^\]]{1,8}\]\s*/g, '').replace(/[$*]+\s*$/, '').trim();
       let qty = pendingQty || 1; pendingQty = null;
       // "NOMBRE  2  7.000" o "NOMBRE 2 3.500 7.000" (cantidad, precio, total)
       const alts = [v];
@@ -559,24 +717,36 @@
       name = name.replace(/^(?:[x×*]+\s+)+/i, '').replace(/\s{2,}/g, ' ').replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9]+/, '').replace(/[\s.:=-]+$/, '').trim();
       if (nLetters(name) < 3) continue;
       if (a.negative) { discSum += v; continue; }
-      r.items.push({ name: name.slice(0, 60), qty, amount: v, alts });
+      r.items.push({ name: name.slice(0, 60), qty, amount: v, alts, sep: a.sep || v < 1000 });
     }
     if (tipSum) r.tip = tipSum; if (discSum) r.discount = discSum; if (shipSum) r.shipping = shipSum;
     // Total por votación entre fuentes independientes (un número mal leído o tapado por un dedo no decide solo)
     {
       const c = new Map(), add = (v, wgt) => { if (v && v >= 100) c.set(v, (c.get(v) || 0) + wgt); };
-      add(totalPay, 3); add(total, 2.5); add(totalRow, 2); add(payCard, 2);
-      if (r.subtotal && taxSum) add(r.subtotal + taxSum, 1.5);
+      add(totalPay, 3); add(total, 2.5); add(totalRow, 2); add(bigTotal, bigW);
+      if (change > 0 && paid > change) add(paid - change, 2.5);
+      if (!(change > 0 && payCard === paid)) add(payCard, 2);   // con cambio, el pago con tarjeta/nota es lo entregado, no el total
+      // subtotal (o base) + IVA, solo si el IVA es una fracción creíble de la base (≤ 20 %)
+      const sub0 = r.subtotal || baseV; if (sub0 && taxSum && taxSum <= sub0 * 0.2 + 2) add(sub0 + taxSum, 1.5);
+      if (minutes !== null && minutes > 0 && rate) add(Math.ceil(minutes * rate / 50) * 50, 1.5);
+      if (looseTotal) { add(looseTotal, 1.5); for (const v of looseAlts) add(v, 1); }
+      if (has19 && (baseV || r.subtotal)) add(Math.round((baseV || r.subtotal) * 1.19), 0.8);
       const isum = r.items.reduce((s, i) => s + i.amount, 0); add(isum + (tipSum || 0) + (shipSum || 0) - (discSum || 0), 1);
-      const cand = r.items.filter(i => ![totalPay, total, totalRow, payCard].includes(i.amount));
-      const maxItem = Math.max(0, ...cand.map(i => Math.min(i.amount, ...(i.alts || [i.amount]))));
-      let best = null, bw = 0;
+      const cand = r.items.filter(i => ![totalPay, total, totalRow, payCard, bigTotal].includes(i.amount));
+      // un "producto" de 18764 sin separador de miles suele ser un número mal leído (resolución, póliza): no cuenta aquí
+      const maxItem = Math.max(0, ...cand.filter(i => i.sep !== false).map(i => Math.min(i.amount, ...(i.alts || [i.amount]))));
+      let best = null, bw = 0; const scored = [];
       for (const [v, wgt] of c) {
         const plaus = v >= maxItem && (!r.subtotal || v >= r.subtotal * 0.98 || r.subtotal > v * 2) && (!maxItem || v <= maxItem * 40) && v < 1e9;
-        const s = wgt + (plaus ? 0 : -2.5); if (s > bw) { bw = s; best = v; }
+        const s = wgt + (plaus ? 0 : v === totalPay || v === total ? -1.8 : -2.5); if (s > bw) { bw = s; best = v; } // un renglón de total explícito pesa más que productos mal leídos
+        if (s > 0) scored.push([v, s]);
       }
+      Object.defineProperty(r, '_cand', { value: scored, enumerable: false }); // para unir dos lecturas
+      { const cs = amountConsensus(scored); if (cs.value && cs.weight > bw + 0.5) { best = cs.value; bw = cs.weight; } }
       r.total = bw > 0 ? best : null;
-      r.totalSource = r.total === null ? null : [totalPay, total, totalRow, payCard].includes(r.total) ? 'line' : 'sum';
+      Object.defineProperty(r, '_votes', { value: [...c].map(([v, w]) => [v, +w.toFixed(2)]), enumerable: false }); // para depurar
+      Object.defineProperty(r, '_score', { value: bw, enumerable: false });
+      r.totalSource = r.total === null ? null : bw >= 2 || [totalPay, total, totalRow, payCard, bigTotal, change > 0 && paid > change ? paid - change : null].includes(r.total) ? 'line' : 'sum';
     }
     // El IVA se valida contra el total (19 % incluido): corrige lecturas como "Sua 19%" o un dígito perdido
     if (r.total && taxSum > r.total * 0.3) { // ese valor era el subtotal (quedó junto a la etiqueta equivocada)
@@ -606,8 +776,9 @@
       // filas de totales o pagos leídas como producto
       if (r.items.length > 1) r.items = r.items.filter(i => i.amount !== r.total && i.amount !== r.subtotal && i.amount !== r.tax);
     }
-    r.items.forEach(i => delete i.alts);
+    r.items.forEach(i => { delete i.alts; delete i.sep; });
     if (r.total === null && r.items.length) r.total = sum(r.items.map(i => i.amount)) + (r.tip || 0) + (r.shipping || 0) - (r.discount || 0);
+    { let bw = 0; for (const [k, wv] of dateVotes) if (wv > bw) { bw = wv; r.date = k; } }
     r.merchant = receiptMerchant(lines);
     return r;
   }
@@ -949,7 +1120,7 @@ function papelera(p) {
     attributeToPeople, txEffects, isActive, accountBalance, personalAmount, receivableParts, expenseInMonth, incomeInMonth, installmentStatus,
     loanTotalInterest, loanSchedule, loanSummary, allocatePayment,
     budgetBase, budgetStatus, txMatchesScope, goalSummary, wishPlan, wishMonthly,
-    duplicateScore, parsePastedText, parseReceiptText, receiptLinesFromWords, mergeReceiptReads, parseAmountToken, csvSafe, toCSV, parseCSV, parseDateFlexible,
+    duplicateScore, parsePastedText, parseReceiptText, receiptLinesFromWords, mergeReceiptReads, parseAmountToken, matchMerchant, editDistance, csvSafe, toCSV, parseCSV, parseDateFlexible,
     encryptBackup, decryptBackup, hashPin, b64, unb64,
     driveSafe, driveTarget, driveScript, DRIVE_SCRIPT_VERSION, DRIVE_MONTHS, unsafeStateFields
   };

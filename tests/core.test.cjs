@@ -238,6 +238,74 @@ test('lectura: total con dos puntos, marca completa y dos lecturas que se comple
   assert.deepEqual(C.receiptLinesFromWords([w('Iva', 10, 100), w('19%', 60, 101), w('6280', 300, 92)]), ['Iva 19% 6280']);
 });
 
+test('lectura: tiquete de parqueadero (fechas 2026-03-14, centavos, cambio, sin tomar placas ni documentos)', () => {
+  // Datos ficticios con la forma de un tiquete de parqueadero
+  const txt = `Security Access
+EDIFICIO CENTRO COMERCIAL LAS PALMAS P.H.
+Entidad sin animo de Lucro
+NIT: 811.222.333-4
+KR. 45- 12-30
+Documento equivalente No.PQA 12345
+Fecha : 2026-03-14
+Placa/Codigo : 55501234
+Entrada : 2026-03-14 10:05
+Salida : 2026-03-14 10:06
+Valor por MINUTO $200
+Documento : 222222222222
+1 [PARQ] Parqueadero $ 168,07
+Subtotal: $ 168,07
+TOTAL A PAGAR ===> $ 200,00
+Base Servicio: $ 168,07
+Impu: 19.00% IVA $ 31,93
+Recibido: $ 2.000,00
+Cambio : $ 1.800,00
+Poliza No. 111-22-33333333333`;
+  const r = C.parseReceiptText(txt);
+  assert.equal(r.total, 200); assert.equal(r.tax, 32); assert.equal(r.subtotal, 168);
+  assert.equal(r.date, '2026-03-14');
+  assert.equal(r.merchant, 'CC LAS PALMAS');
+  assert.deepEqual(r.items.map(i => [i.name, i.qty, i.amount]), [['Parqueadero', 1, 168]]);
+  // sin la línea del total: lo recibido menos el cambio
+  const r2 = C.parseReceiptText(txt.replace('TOTAL A PAGAR ===> $ 200,00\n', ''));
+  assert.equal(r2.total, 200);
+});
+test('lectura: comprobante con logo en letras separadas, total con asteriscos y pago con nota crédito', () => {
+  const txt = `B R A V O
+CUEROS BRAVO S.A.S
+AV CL 45 # 10-20 CC PLAZA CENTRAL LC 1010
+SEDE PRINCIPAL MEDELLIN
+Ticket Fecha Hora Tienda Caja
+771204 14/03/26 10:40 2201 220104
+Cliente : JUAN PEREZ
+Documento 1234567890
+1 BOLSO MANO 389.000
+**** $ 389.000 ****
+Medio de pago Valor Num./Apro Fecha
+Nota Credito 439.000 14/03/2026
+Cambio en Nota Credito $50.000`;
+  const r = C.parseReceiptText(txt);
+  assert.equal(r.merchant, 'BRAVO');
+  assert.equal(r.total, 389000);                 // no la cédula, no lo pagado con la nota (439.000)
+  assert.equal(r.date, '2026-03-14');
+  assert.deepEqual(r.items.map(i => [i.name, i.amount]), [['BOLSO MANO', 389000]]);
+  // como lo entrega a veces el lector: logo mal leído, "74/03/26", año "2076" y asteriscos cambiados
+  const ocr = txt.replace('B R A V O', 'Bb R  AA V O').replace('14/03/26', '74/03/26').replace('14/03/2026', '14/03/2076').replace('**** $ 389.000 ****', 'XX $ 389.000 +*%%');
+  const o = C.parseReceiptText(ocr);
+  assert.equal(o.merchant, 'BRAVO'); assert.equal(o.total, 389000); assert.equal(o.date, '2026-03-14');
+});
+
+test('lectura: la tienda leída se une con la que ya existe aunque el lector cambie letras', () => {
+  const known = ['Éxito Calle 80', 'CC Las Palmas', 'Bravo Plaza Central', 'Panadería La Espiga'];
+  assert.equal(C.matchMerchant('CC LAS PALNAS', known), 'CC Las Palmas');
+  assert.equal(C.matchMerchant('CC LAS PALMAS', known), 'CC Las Palmas');
+  assert.equal(C.matchMerchant('BRAVO', known), 'Bravo Plaza Central');
+  assert.equal(C.matchMerchant('D1', known), null);
+  assert.equal(C.matchMerchant('FALABELLA', known), null);
+  // dos lecturas del mismo total con cifras cambiadas: se vota cifra por cifra
+  const a = C.parseReceiptText('1 BOLSO MANO 389.064\n**** $ 389.004 ****'), b = C.parseReceiptText('**** $ 389.364 ****\nNota Credito 439.064\nCambio en Nota Credito $50.000');
+  assert.equal(C.mergeReceiptReads(a, b).total, 389064);
+});
+
 test('lista de deseos: fondo mensual, plan por prioridad y fecha en que alcanza', () => {
   const fund = { start: '2026-09', history: [{ from: '2026-09', amount: 300000 }], adjustments: [{ amount: 200000 }], horizon: '2026-12-31' };
   const wishes = [

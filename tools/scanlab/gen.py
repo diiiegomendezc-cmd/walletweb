@@ -10,6 +10,10 @@ FONTS = ['/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', '/usr/share/font
          '/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Medium.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf',
          '/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf']
 W, H = 1512, 2016
+# Si una fuente no está instalada se usa una equivalente (la lista conserva su largo: las mismas semillas dan las mismas facturas)
+_FALLBACK = {'JetBrainsMono-Medium.ttf': '/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf',
+             'JetBrainsMono-Regular.ttf': '/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf'}
+FONTS = [f if os.path.exists(f) else _FALLBACK.get(os.path.basename(f), FONTS[0]) for f in FONTS]
 
 STORES = [
     ('PERMODA LTDA.', 'KOAJ', '860.516.806 - 5'), ('ALMACENES EXITO S.A.', 'EXITO', '890.900.608 - 9'),
@@ -283,7 +287,7 @@ def draw_hand(rng, quad, layer_rgba):
     return col, a, ap
 
 
-def make_sample(idx, seed):
+def make_sample(idx, seed, prefix='syn_'):
     rng = random.Random(seed)
     lines, fields = make_content(rng)
     paper, boxes, lh = render_paper(rng, lines)
@@ -332,7 +336,7 @@ def make_sample(idx, seed):
     img += np.random.default_rng(seed).normal(0, rng.uniform(2, 5), img.shape)
     out = Image.fromarray(img.clip(0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(rng.uniform(0.3, 1.0)))
     os.makedirs(os.path.join(HERE, 'imgs'), exist_ok=True); os.makedirs(os.path.join(HERE, 'gt'), exist_ok=True)
-    name = f'syn_{idx:03d}'
+    name = f'{prefix}{idx:03d}'
     out.save(os.path.join(HERE, 'imgs', name + '.jpg'), quality=rng.randint(72, 92))
     Image.fromarray((gt_paper * 255).astype(np.uint8)).save(os.path.join(HERE, 'gt', name + '.png'))
     # ¿qué líneas quedaron visibles? (centro de la línea dentro de la foto)
@@ -355,6 +359,7 @@ def make_sample(idx, seed):
 if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     seed0 = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
+    prefix = sys.argv[3] if len(sys.argv) > 3 else 'syn_'
     for i in range(n):
-        m = make_sample(i, seed0 + i)
+        m = make_sample(i, seed0 + i, prefix)
         print(m['name'], m['bg'], 'mano' if m['hand'] else '', 'cortada' if m['cut_bottom'] else '')
