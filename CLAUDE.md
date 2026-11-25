@@ -14,7 +14,7 @@ Antes de cambiar algo grande, lee `PROJECT_STATUS.md` (decisiones y límites) y 
 | `app-base.js` | Estado `S`, valores por defecto, íconos (`ICONS`/`ic()`), almacenamiento, hojas (`openSheet`), menú inferior editable (`TAB_OPTIONS`), `APP_VERSION` |
 | `app-views.js` | Pantallas (`VIEWS`, `PARENT`, `render()`, `go()`) |
 | `app-forms.js` | Formularios: movimiento (`txForm`), factura, deseos, presupuestos, etc. |
-| `app-scan.js` | Escáner de facturas: detección del papel, bordes curvos, recorte, enderezado, limpieza, PDF, visor |
+| `app-scan.js` | Escáner de facturas: detección del papel, bordes curvos, recorte, enderezado (`scanDeskew`; renglones de papel arrugado con `scanDewarp`: línea base de las palabras → malla de inclinaciones con "puentes" entre etiqueta y monto para no descuadrar columnas; `sRigidLines`: las letras se mueven enteras y el estiramiento va al blanco entre renglones), limpieza (`scanClean`; en el modo mejorado solo queda lo impreso, `sTextKeep`), copia ampliada para el lector (`scanForOcr`), lectura de respaldo sin enderezar renglones (`scanFlat`, solo si a la primera lectura le falta algo), PDF, visor |
 | `app-charts.js` | Gráficos con filtros: los del Inicio (`HOME_CHARTS`, filtros en `S.settings.homeCharts`) y "Mis gráficos" (`S.charts`). Tocar/deslizar muestra los movimientos. Se carga después de `app-main.js` |
 | `app-fx.js` | Movimiento y vidrio: lente del menú inferior, reflejos con el scroll, ondas, transición entre pantallas, tinte del formulario por categoría. Envuelve `render`, `go`, `openTxForm` y `rerenderTx`. Se carga al final |
 | `app-loans.js` | Préstamos en el Inicio, historial de pagos, abonos desde el formulario de Ingreso (detección de quién devuelve, `D.loanMode`/`D.loanId`, se guarda como `repay_in` en `txSave`) y filtros compactos de Movimientos. Envuelve `updateTxLive` |
@@ -57,4 +57,9 @@ Antes de cambiar algo grande, lee `PROJECT_STATUS.md` (decisiones y límites) y 
   una cuenta "Fondo de ahorro" y transferencias, o (b) un fondo automático que al cierre del mes guarde el
   sobrante. Falta que elija qué cuenta como "sobrante": lo que queda del presupuesto Global (tope − gastado)
   o lo real (recibido − gastado).
-- Escáner: con cada foto real que falle, pásala por `tools/scanlab/run_one.js` (sin subirla al repo) y vuelve a medir el conjunto sintético para no empeorar (meta > 90 %).
+- Escáner: con cada foto real que falle, pásala por `tools/scanlab/run_one.js` (sin subirla al repo) y vuelve a medir los conjuntos
+  sintéticos `syn_`, `val_` y `arr_` (arrugadas) para no empeorar (meta > 90 % en `syn_`/`val_`). Las fotos que llegan por el chat
+  vienen reducidas (~1500×2000): la lectura real en la app, con Foto HD (12 MP), es mejor que en esas pruebas.
+- Historial de git: commits anteriores a v1.34 aún contienen datos personales que ya se quitaron de los archivos. Reescribir
+  el historial (y forzar el envío a GitHub) espera la autorización explícita del dueño; si la da, rehacer la limpieza sobre
+  `main` actual (los textos a borrar están descritos en `PROJECT_STATUS.md`, sección de seguridad, sin repetirlos aquí).

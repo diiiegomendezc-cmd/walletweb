@@ -344,3 +344,73 @@ test('copias restauradas: se rechazan identificadores, fechas y colores con form
   assert.deepEqual(C.unsafeStateFields(bad), ['copia.transactions[0].id', 'copia.transactions[0].date', 'copia.transactions[0].people', 'copia.accounts[0].color', 'copia.settings.glass.blur', 'copia.wishes[0].cond.cuotas']);
   assert.deepEqual(C.unsafeStateFields(null), ['copia']);
 });
+
+test('lectura de tirilla de parqueadero arrugada: centavos, P.H., etiquetas mal leídas y números que no son montos', () => {
+  // Texto ficticio con los errores típicos del lector en una tirilla arrugada
+  const txt = `Security Access
+EDIF
+TEZO cenTRO CONERCIA LOS ALAMOS P,H.
+Entidad sin Animo de Lucro
+NIT: 900.123.456-7
+KR. 10 - 20-30
+Tel: 601-1234567
+Documento equivalente No.ABC 12345
+- r 2019-10-12
+Punto fact. 001
+Concepto PARQUEO - Normal
+Placa/Codigo 50012345
+Entrada 2026-10-12 08:05
+Salida 2026-10-12 09:10
+Tiempo 01:05
+Tarifa CARRO
+alor por MINUTU $120
+Nombre CONSUMIDOR FINAL
+Documento 222222222222
+Cnt Cod. Descripcion Subtotal
+1 [PARQ] Parqueayero “€ 6.554,62.
+cubtoid : $ 6.554,62
+[OTAL A PAGAR => y 7.800,007
+DESGLOSE DE SERVICIO
+ase Servicio: $ 6.554,62
+(mpu: 19.00% ÍvA 5 1.245,38
+Forma de pago Efectivo
+Recibido: $ 10.000,00
+anbio : $ 2.200,00
+P<liza No. 360-94-99000000670
+DIAN NO. 18764000000000`;
+  const r = C.parseReceiptText(txt);
+  assert.equal(r.total, 7800);            // "7.800,007" = 7.800,00 con una marca; y 10.000 − 2.200
+  assert.equal(r.subtotal, 6555);         // 6.554,62 redondeado a pesos
+  assert.equal(r.tax, 1245);
+  assert.equal(r.date, '2026-10-12');     // la de entrada/salida, no la del renglón mal leído
+  assert.deepEqual(r.items.map(i => [i.name, i.qty, i.amount]), [['Parqueadero', 1, 6555]]);
+  assert.match(r.merchant, /^EDIFICIO CENTRO COMERCIAL .+ P\.H\.$/);
+  assert.equal(C.parseReceiptText('Fecha 2026-10-12\nTOTAL 10.000').date, '2026-10-12'); // año-mes-día
+  assert.equal(C.parseReceiptText('Fecha 12/10/26\nTOTAL 10.000').date, '2026-10-12');
+});
+
+test('tienda leída: cifras confundidas con letras, encabezado del sistema y nombre que el usuario ya escribió', () => {
+  // datos ficticios
+  const r = C.parseReceiptText('vecur1t, Átess\nEDIF\n"TO CENTRO CONERCIA 109 PINOS P.H,  /\nNIT: 900.000.000-1\nTOTAL A PAGAR 3.000,00');
+  assert.equal(r.merchant, 'EDIFICIO CENTRO COMERCIAL LOS PINOS P.H.');
+  assert.equal(r.total, 3000);
+  const known = ['Éxito Calle 80', 'Edificio Centro Comercial Los Pinos P.H.', 'D1'];
+  assert.equal(C.knownName('EDIFICIO CENTRO COMERCIAL 109 PIN0S P.H.', known), 'Edificio Centro Comercial Los Pinos P.H.');
+  assert.equal(C.knownName('EXITO CALLE 80', known), 'Éxito Calle 80');
+  assert.equal(C.knownName('FARMATODO', known), null); // nada parecido: se deja lo leído
+  assert.equal(C.knownName('D1', known), null);        // muy corto para comparar
+});
+
+test('total con la primera cifra perdida, IVA que no cuadra y total sin imprimir (datos ficticios)', () => {
+  let r = C.parseReceiptText('PARQUEADERO EL ROBLE\nSubtotal: $ 210,08\nTOTAL A PAGAR => $50,00\nImpu: 19.00% IVA $ 39,92\nFecha 2026-10-12');
+  assert.equal(r.total, 250); assert.equal(r.subtotal, 210); assert.equal(r.tax, 40);
+  // IVA mal leído ("9") con total y subtotal claros: el impuesto es la diferencia (19 %)
+  r = C.parseReceiptText('PARQUEADERO EL ROBLE\nSubtotal: $ 210,08\nImpu: 19.00% IVA $ 9\nTOTAL A PAGAR $ 250,00');
+  assert.equal(r.tax, 40);
+  // sin total legible pero con subtotal e "IVA 19 %": se propone subtotal + 19 %
+  r = C.parseReceiptText('PARQUEADERO EL ROBLE\nSubtotal: $ 210,08\nImpu: 19.00% IVA\nForma de pago: Efectivo');
+  assert.equal(r.total, 250);
+  // la propina no se confunde con el impuesto
+  r = C.parseReceiptText('Subtotal 59.400\nImpoconsumo 8% 4.752\nPropina 5.940\nTOTAL A PAGAR 70.092');
+  assert.equal(r.tax, 4752);
+});
