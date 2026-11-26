@@ -47,8 +47,8 @@ const ACT = {
   scanOpen: () => { if (!D) return; D._srcHash = null; openScanner(useScan); },
   rcptView: el => viewReceipt(el.dataset.id || null),
   scanAdjust: () => { if (D?._scan) openScanner(useScan, { canvas: D._scan.src, quad: D._scan.quad, curve: D._scan.curve, userCurve: D._scan.userCurve }); },
-  rcptRemove: () => { if (D._thumbUrl) URL.revokeObjectURL(D._thumbUrl); D._thumbUrl = null; D.receiptBlob = null; D.receiptMeta = null; D.removeReceipt = true; D.ocr = null; D._ocrFile = null; D._scan = null; D._scanJpeg = null; D._thumbBlob = null; rerenderTx(); },
-  ocrRerun: () => { if (D?._ocrFile) runOcr(D._ocrFile); },
+  rcptRemove: () => { if (D._thumbUrl) URL.revokeObjectURL(D._thumbUrl); D._thumbUrl = null; D.receiptBlob = null; D.receiptMeta = null; D.removeReceipt = true; D.ocr = null; D._ocrFile = null; D._ocrFlat = null; D._scan = null; D._scanJpeg = null; D._thumbBlob = null; rerenderTx(); },
+  ocrRerun: () => { if (D?._ocrFile) runOcr(D._ocrFile, D._scanCharH, D._ocrFlat); },
   ocrUse: el => { const r = D.ocr?.r; if (!r) return; const k = el.dataset.k;
     if (k === 'amount') { D.amountText = Number(r.total).toLocaleString('es-CO'); D.ocrFilled.amount = true; }
     if (k === 'date') D.date = r.date;

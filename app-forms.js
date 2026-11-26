@@ -199,9 +199,11 @@ async function useScan(res) {
   D.receiptBlob = pdf;
   D.receiptMeta = { name: 'Factura.pdf', type: 'application/pdf', size: pdf.size, hash: D._srcHash || await blobHash(jpeg), scanned: true, mode: res.mode };
   D._srcHash = null;
-  D.removeReceipt = false; D._ocrFile = cv; D.more = true;
+  D.removeReceipt = false; D._ocrFile = cv; D._scanCharH = res.charH || 0; D._ocrFlat = res.flatSrc ? { flatSrc: res.flatSrc, flatMode: res.flatMode } : null; D.more = true;
   if (res.fingers > 50) toast('Se borraron los dedos que tapaban el borde.');
-  if (D.type === 'expense' || D.type === 'income') runOcr(cv); else rerenderTx();
+  // Foto de poca resolución (cámara en vivo) y letra pequeña: con la cámara del teléfono a resolución completa se lee mucho mejor
+  else if (res.charH && res.charH < 17 && res.src && Math.max(res.src.width, res.src.height) < 2600) toast('La letra quedó pequeña. Para leerla mejor, escanea con "Foto HD".', null, null, 6000);
+  if (D.type === 'expense' || D.type === 'income') runOcr(cv, res.charH, D._ocrFlat); else rerenderTx();
 }
 async function blobHash(b) { return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', await b.arrayBuffer()))).map(x => x.toString(16).padStart(2, '0')).join(''); }
 function ocrStatusHTML() {
@@ -209,7 +211,7 @@ function ocrStatusHTML() {
   if (o.state === 'running') return `<div class="small" style="font-weight:600">${esc(o.step || 'Leyendo la factura…')}</div><div style="margin-top:8px">${progress(Math.round((o.progress || 0) * 100))}</div>`;
   if (o.state === 'error') return `<div class="small neg" style="font-weight:600">${esc(o.msg)}</div>`;
   const r = o.r, f = v => C.formatMoney(v);
-  const bits = [r.merchant ? niceName(r.merchant) : '', r.date ? fdShort(r.date) : '', r.total ? 'Total ' + f(r.total) : '', r.tax ? 'Impuestos ' + f(r.tax) : '', r.tip ? 'Propina ' + f(r.tip) : '', r.discount ? 'Descuento ' + f(r.discount) : '', r.shipping ? 'Envío ' + f(r.shipping) : '', r.items.length ? r.items.length + ' producto(s)' : ''].filter(Boolean);
+  const bits = [r.merchant ? ocrMerchant(r.merchant) : '', r.date ? fdShort(r.date) : '', r.total ? 'Total ' + f(r.total) : '', r.tax ? 'Impuestos ' + f(r.tax) : '', r.tip ? 'Propina ' + f(r.tip) : '', r.discount ? 'Descuento ' + f(r.discount) : '', r.shipping ? 'Envío ' + f(r.shipping) : '', r.items.length ? r.items.length + ' producto(s)' : ''].filter(Boolean);
   if (!bits.length) return `<div class="small" style="font-weight:600">No pude leer datos claros en la foto.</div><div class="small muted">Prueba con más luz y la factura derecha, o escríbelos a mano.</div>`;
   const amt = C.evalAmount(D.amountText), sug = [];
   if (r.total && amt && amt !== r.total) sug.push(`<button type="button" class="chip" data-act="ocrUse" data-k="amount">Usar total ${esc(f(r.total))}</button>`);
@@ -219,11 +221,21 @@ function ocrStatusHTML() {
     ${sug.length ? `<div class="chips wrap" style="margin-top:8px">${sug.join('')}</div>` : ''}<div class="tiny muted" style="margin-top:6px">Los campos marcados “de la foto” se pueden corregir.</div>`;
 }
 // "ARTURO CALLE" → "Arturo Calle"; siglas cortas (D1, KOAJ) se dejan tal cual
+// "EDIFICIO CENTRO COMERCIAL LOS PINOS P.H." → "Edificio Centro Comercial Los Pinos P.H."; siglas cortas (D1, KOAJ, P.H.) se dejan igual
+const NICE_LOWER = new Set(['de', 'del', 'y', 'e', 'en', 'a', 'al', 'con', 'por', 'para']), NICE_WORDS = new Set(['la', 'las', 'los', 'el', 'san', 'sur', 'mi', 'su', 'sin', 'mas', 'gran', 'casa', 'mar', 'sol', 'luz', 'paz']);
+// Tienda leída de la foto: si se parece a una que el usuario ya escribió antes, se usa como él la escribió
+function ocrMerchant(m) {
+  const known = [...new Set(S.transactions.filter(t => t.merchant && !t.deletedAt).map(t => t.merchant))].slice(-300);
+  return C.knownName(m, known) || C.matchMerchant(m, known) || niceName(m);
+}
 function niceName(s) {
   s = String(s || '').trim();
-  const SMALL = /^(DE|DEL|Y|E|EN|LA|LAS|EL|LOS|SAN|SANTA)$/; // palabras comunes: no son siglas
-  return s.split(/\s+/).map((w, i) => SMALL.test(w) ? (i && /^(DE|DEL|Y|E|EN)$/.test(w) ? w.toLowerCase() : w.charAt(0) + w.slice(1).toLowerCase())
-    : w.length <= 4 && /^[A-Z0-9&.]+$/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ').slice(0, 60);
+  return s.split(/\s+/).map((w, i) => {
+    const lw = w.toLowerCase();
+    if (i > 0 && NICE_LOWER.has(lw)) return lw;
+    if (w.length <= 4 && /^[A-Z0-9&.]+$/.test(w) && !NICE_WORDS.has(lw)) return w;
+    return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+  }).join(' ').slice(0, 60);
 }
 function receiptItems(items) { return items.map(i => ({ name: i.name.charAt(0) + i.name.slice(1).toLowerCase(), qty: String(i.qty || 1), unit: Math.round(i.amount / (i.qty || 1)).toLocaleString('es-CO') })); }
 function itemsText(items) { return items.map(i => `${i.qty > 1 ? i.qty + ' × ' : ''}${i.name.charAt(0) + i.name.slice(1).toLowerCase()} — ${C.formatMoney(i.amount)}`).join('\n'); }
@@ -234,11 +246,7 @@ function applyReceiptData(r, source) {
   for (const k of ['tax', 'tip', 'discount', 'shipping']) if (r[k] && !String(D[k] || '').trim()) { D[k] = fmt(r[k]); D.ocrFilled[k] = true; if (!D.rows.includes(k)) D.rows = EXTRA_ROWS.map(x => x[0]).filter(x => D.rows.includes(x) || x === k); }
   if (r.total && !C.evalAmount(D.amountText)) { D.amountText = fmt(r.total); D.ocrFilled.amount = true; }
   if (r.items.length && !D.items.some(it => String(it.name).trim())) { D.items = receiptItems(r.items); D.ocrFilled.items = true; }
-  if (r.merchant && !String(D.merchant || '').trim() && D.type === 'expense') {
-    // si ya compraste ahí, se usa el nombre como lo escribiste tú (el lector a veces cambia una letra)
-    const known = [...new Set(S.transactions.filter(t => !t.deletedAt && t.merchant).map(t => t.merchant))];
-    D.merchant = C.matchMerchant(r.merchant, known) || niceName(r.merchant); D.ocrFilled.merchant = true;
-  }
+  if (r.merchant && !String(D.merchant || '').trim() && D.type === 'expense') { D.merchant = ocrMerchant(r.merchant); D.ocrFilled.merchant = true; }
   if (r.date && D.date === today() && !D.id && r.date <= today() && C.diffDays(r.date, today()) <= 400) { D.date = r.date; D.ocrFilled.date = true; }
   D.ocr = { state: 'done', r, source };
   D.more = true;
@@ -277,12 +285,15 @@ async function ocrCanvas(file) {
   } finally { URL.revokeObjectURL(url); }
 }
 function paintOcr() { const el = $('#ocrStatus'); if (el) { el.hidden = !D?.ocr; el.innerHTML = ocrStatusHTML(); } }
-async function runOcr(src) {
+async function runOcr(src, charH, flat) {
   const me = D;
   if (!me) return;
   me.ocr = { state: 'running', progress: 0, step: 'Preparando la foto…' }; me.more = true; rerenderTx();
   try {
-    const canvas = src instanceof HTMLCanvasElement ? src : await ocrCanvas(src);
+    // Factura escaneada con letra pequeña: el lector recibe una copia ampliada (lee mucho mejor con letras de ~26 px)
+    const isCv = src instanceof HTMLCanvasElement;
+    const canvas = isCv ? (charH && typeof scanForOcr === 'function' ? scanForOcr({ canvas: src, charH }) : src) : await ocrCanvas(src);
+    const kOcr = isCv ? canvas.width / src.width : 1;
     ocrLogger = m => {
       if (D !== me || !me.ocr || me.ocr.state !== 'running') return;
       if (m.status === 'recognizing text') { me.ocr.step = 'Leyendo la factura…'; me.ocr.progress = m.progress; }
@@ -304,9 +315,17 @@ async function runOcr(src) {
       } finally { await w.setParameters({ tessedit_pageseg_mode: '6' }); }
       if (D !== me) return;
     }
+    if ((!r.total || !r.tax || !sumOk(r) || !r.date || !r.merchant) && flat && typeof scanFlat === 'function') {
+      // Tirilla arrugada: lectura de respaldo de la foto sin enderezar renglones (una columna mal alineada no se pierde)
+      me.ocr.step = 'Revisando otra vez…'; me.ocr.progress = 0; paintOcr();
+      await new Promise(ok => setTimeout(ok, 30));
+      const fr = scanFlat(flat);
+      if (fr) r = C.mergeReceiptReads(r, C.parseReceiptText((await w.recognize(scanForOcr(fr), {}, { text: true })).data.text));
+      if (D !== me) return;
+    }
     applyReceiptData(r, 'foto');
     if (me._scanJpeg) { // PDF con texto invisible encima de la imagen: se puede buscar y copiar
-      const words = ocrWords(data);
+      const words = ocrWords(data).map(w => kOcr === 1 ? w : Object.assign({}, w, { bbox: { x0: w.bbox.x0 / kOcr, x1: w.bbox.x1 / kOcr, y0: w.bbox.y0 / kOcr, y1: w.bbox.y1 / kOcr } }));
       if (words.length) { const pdf = await buildReceiptPdf(me._scanJpeg, me._scanSize[0], me._scanSize[1], words); me.receiptBlob = pdf; me.receiptMeta.size = pdf.size; me._pdfWords = words.length; }
     }
   } catch (e) {
@@ -558,7 +577,7 @@ async function receiptPick(input) {
   const dup = S.transactions.find(t => t.receipt?.hash === hash && t.id !== D.id && !t.deletedAt);
   if (dup && !(await confirmDialog(`Este comprobante ya está adjunto a "${txTitle(dup)}" (${fdShort(dup.date)}). ¿Adjuntarlo de todos modos?`, { title: 'Posible duplicado', confirmText: 'Adjuntar' }))) return;
   if (D._thumbUrl) { URL.revokeObjectURL(D._thumbUrl); D._thumbUrl = null; }
-  D.receiptBlob = blob; D.receiptMeta = { name, type: blob.type, size: blob.size, hash }; D.removeReceipt = false; D._scan = null; D._scanJpeg = null; D._thumbBlob = null; D._ocrFile = kind === 'image' ? f : null; D.more = true;
+  D.receiptBlob = blob; D.receiptMeta = { name, type: blob.type, size: blob.size, hash }; D.removeReceipt = false; D._scan = null; D._scanJpeg = null; D._thumbBlob = null; D._ocrFile = kind === 'image' ? f : null; D._ocrFlat = null; D.more = true;
   if (kind === 'image' && (D.type === 'expense' || D.type === 'income')) runOcr(f);
   else { rerenderTx(); toast('Factura adjunta (' + Math.round(blob.size / 1024) + ' KB)'); }
 }

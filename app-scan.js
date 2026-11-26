@@ -75,10 +75,12 @@ function sReadSmall(source, sw, sh, maxSide) {
 }
 // Ganancias de balance de blancos a partir de lo más claro (normalmente el papel)
 function sWhiteGains(d, n) {
-  const lum = new Float32Array(n); for (let i = 0; i < n; i++) lum[i] = d[i * 4] + d[i * 4 + 1] + d[i * 4 + 2];
-  const s = Array.from(lum.filter((_, i) => !(i % 5))).sort((a, b) => a - b), t = s[Math.floor(s.length * 0.88)];
+  // percentil 88 del brillo con un histograma (rápido aunque la foto sea grande)
+  const hist = new Uint32Array(766); let m5 = 0;
+  for (let i = 0; i < n; i += 5) { hist[d[i * 4] + d[i * 4 + 1] + d[i * 4 + 2]]++; m5++; }
+  let t = 765; for (let v = 0, acc = 0; v < 766; v++) { acc += hist[v]; if (acc > m5 * 0.88) { t = v; break; } }
   let r = 0, g = 0, b = 0, c = 0;
-  for (let i = 0; i < n; i++) if (lum[i] >= t && lum[i] < 760) { r += d[i * 4]; g += d[i * 4 + 1]; b += d[i * 4 + 2]; c++; }
+  for (let i = 0; i < n; i++) { const L = d[i * 4] + d[i * 4 + 1] + d[i * 4 + 2]; if (L >= t && L < 760) { r += d[i * 4]; g += d[i * 4 + 1]; b += d[i * 4 + 2]; c++; } }
   if (!c) return [1, 1, 1];
   const m = (r + g + b) / 3 / c, cl = v => Math.max(0.7, Math.min(2.2, v));
   return [cl(m / (r / c)), cl(m / (g / c)), cl(m / (b / c))];
@@ -680,9 +682,9 @@ function sInkSmall(canvas, Wd) {
   return { ink, Wd, Hd, f };
 }
 // Nitidez de renglones: con renglones rectos el perfil horizontal tiene picos altos y valles limpios
-function sRowSharpness(ink, Wd, Hd, dyAt) {
+function sRowSharpness(ink, Wd, Hd, dyAt, xa = 0, xb = Wd) {
   const prof = new Float32Array(Hd + 2); let tot = 0;
-  for (let y = 0; y < Hd; y++) for (let x = 0; x < Wd; x++) {
+  for (let y = 0; y < Hd; y++) for (let x = xa; x < xb; x++) {
     const v = ink[y * Wd + x]; if (!v) continue;
     const yy = dyAt ? y - dyAt(x, y) : y; const y0 = Math.floor(yy), fr = yy - y0; if (y0 < 0 || y0 >= Hd) continue;
     prof[y0] += v * (1 - fr); prof[y0 + 1] += v * fr; tot += v;
@@ -789,47 +791,11 @@ function scanStraighten(canvas) {
   return out;
 }
 
-// Recorta el blanco sobrante alrededor del texto (queda un margen parejo)
-function scanTrim(canvas) {
-  const w = canvas.width, h = canvas.height, d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
-  const rows = new Uint32Array(h), cols = new Uint32Array(w);
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = (y * w + x) * 4; if (d[i] + d[i + 1] + d[i + 2] < 480) { rows[y]++; cols[x]++; } }
-  const minRow = Math.max(2, w * 0.004), minCol = Math.max(2, h * 0.002);
-  let y0 = 0, y1 = h - 1, x0 = 0, x1 = w - 1;
-  while (y0 < h && rows[y0] < minRow) y0++; while (y1 > y0 && rows[y1] < minRow) y1--;
-  while (x0 < w && cols[x0] < minCol) x0++; while (x1 > x0 && cols[x1] < minCol) x1--;
-  if (y1 - y0 < h * 0.2 || x1 - x0 < w * 0.2) return canvas; // casi vacío: no tocar
-  const m = Math.round(Math.max(x1 - x0, 200) * 0.06);
-  x0 = Math.max(0, x0 - m); y0 = Math.max(0, y0 - m); x1 = Math.min(w - 1, x1 + m); y1 = Math.min(h - 1, y1 + m);
-  const nw = x1 - x0 + 1, nh = y1 - y0 + 1;
-  if (nw * nh > w * h * 0.92) return canvas;
-  const out = document.createElement('canvas'); out.width = nw; out.height = nh;
-  out.getContext('2d').drawImage(canvas, x0, y0, nw, nh, 0, 0, nw, nh); return out;
-}
-function sSolve(A, b) { // Gauss con pivoteo; null si es singular
-  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
-  for (let c = 0; c < n; c++) { let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
-    if (Math.abs(M[p][c]) < 1e-12) return null; [M[c], M[p]] = [M[p], M[c]];
-    for (let r = 0; r < n; r++) { if (r === c) continue; const k = M[r][c] / M[c][c]; for (let j = c; j <= n; j++) M[r][j] -= k * M[c][j]; } }
-  return M.map((r, i) => r[n] / r[i]);
-}
-
-/* Limpieza "recién impresa": solo sobrevive lo que está impreso.
-   Lo impreso son letras alineadas en renglones (de cualquier tamaño: texto normal, total grande, logo), rayas de
-   separación en fila y gráficos compactos (QR, logos). Pliegues, arrugas, sombras de dedos y restos del fondo no
-   forman renglones: son trazos largos, torcidos o sueltos, y se borran aunque sean tan oscuros como la tinta. */
-// Grosor del trazo y alto de letra a partir de una tinta preliminar
-function sInkScale(ink, w, h) {
-  const runs = [];
-  for (let y = 0; y < h; y += 2) { let r = 0; for (let x = 0; x <= w; x++) { if (x < w && ink[y * w + x]) r++; else { if (r >= 1 && r <= 40) runs.push(r); r = 0; } } }
-  // moda (no mediana): las letras dan muchos trazos del mismo grosor; sombras y manchas dan largos dispersos
-  const cnt = new Float32Array(42); for (const r of runs) cnt[r]++;
-  let best = 0, sw = 2;
-  for (let r = 2; r <= 40; r++) { const v = cnt[r - 1] * 0.25 + cnt[r] + cnt[r + 1] * 0.5; if (v > best) { best = v; sw = r; } } // los trazos de 1 px son ruido o bordes
-  if (!runs.length) sw = 2;
-  sw = Math.max(1.2, Math.min(14, sw));
-  return { sw };
-}
+/* Renglones rectos en papel arrugado. Se buscan las letras (manchas del tamaño de un carácter), se encadenan en tramos
+   de renglón y se mide la inclinación local de cada tramo (mediana de pendientes entre letras cercanas: aguanta tildes,
+   puntos y letras con cola). Con esas inclinaciones se arma un campo suave en toda la hoja y se recorre desde el centro:
+   cada columna sube o baja lo necesario para que los renglones queden horizontales, aunque cada parte de la tirilla esté
+   torcida distinto. Solo se aplica si los renglones quedan más nítidos que antes. */
 // Componentes conexas (8 vecinos) con sus medidas
 function sComponents(mask, w, h, nv) {
   const n = w * h, lab = new Int32Array(n), stack = new Int32Array(n), C = [];
@@ -857,187 +823,375 @@ function sComponents(mask, w, h, nv) {
   }
   return { lab, C };
 }
-// Decide qué componentes son impresión. Devuelve la máscara de lo que se conserva (1) y el alto típico de letra
-function sPrintedMask(ink, nv, w, h, sw, fGrown) {
-  const { lab, C } = sComponents(ink, w, h, nv);
-  const minH = Math.max(4, sw * 2.2);
-  // Grosor de cada pieza (distancia al borde): las letras son trazos finos; las sombras de los pliegues, manchas macizas
-  {
-    const dt = new Uint8Array(w * h);
-    for (let p = 0; p < w * h; p++) dt[p] = ink[p] ? 255 : 0;
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const p = y * w + x; if (!dt[p]) continue;
-      const m = Math.min(x > 0 ? dt[p - 1] : 0, y > 0 ? dt[p - w] : 0, x > 0 && y > 0 ? dt[p - w - 1] : 0, x < w - 1 && y > 0 ? dt[p - w + 1] : 0); if (m + 1 < dt[p]) dt[p] = m + 1; }
-    for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) { const p = y * w + x; if (!dt[p]) continue;
-      const m = Math.min(x < w - 1 ? dt[p + 1] : 0, y < h - 1 ? dt[p + w] : 0, x < w - 1 && y < h - 1 ? dt[p + w + 1] : 0, x > 0 && y < h - 1 ? dt[p + w - 1] : 0); if (m + 1 < dt[p]) dt[p] = m + 1; }
-    const th = new Uint8Array(C.length + 1); for (let p = 0; p < w * h; p++) { const id = lab[p]; if (id && dt[p] > th[id]) th[id] = dt[p]; }
-    for (const c of C) c.thick = th[c.id];
-  }
-  // Alto típico de letra: solo cuentan las piezas que tienen al lado otra de alto parecido a la misma altura
-  // (los pedacitos de pliegues no forman filas; las letras sí)
-  const pre = C.filter(c => c.h >= minH && c.area >= sw * sw * 1.5 && c.w <= c.h * 9);
-  let L = 20, thickL = Math.max(1, Math.round(sw / 2 + 0.5));
-  {
-    const cs = 32, gw0 = Math.ceil(w / cs) + 1, g0 = new Map();
-    pre.forEach((c, i) => { const k = ((c.cy / cs) | 0) * gw0 + ((c.cx / cs) | 0); if (!g0.has(k)) g0.set(k, []); g0.get(k).push(i); });
-    const hs = [], ths = [];
-    pre.forEach(a => {
-      const R = Math.ceil(a.h * 2.5 / cs) + 1, gx = (a.cx / cs) | 0, gy = (a.cy / cs) | 0, Ry = Math.ceil(a.h / cs) + 1;
-      let ok = false;
-      for (let yy = gy - Ry; yy <= gy + Ry && !ok; yy++) for (let xx = gx - R; xx <= gx + R && !ok; xx++) {
-        const lst = g0.get(yy * gw0 + xx); if (!lst) continue;
-        for (const j of lst) { const b = pre[j]; if (b === a) continue;
-          if (Math.max(a.h, b.h) > 1.5 * Math.min(a.h, b.h) || Math.abs(a.cy - b.cy) > 0.35 * Math.max(a.h, b.h)) continue;
-          const gap = Math.max(a.x0, b.x0) - Math.min(a.x1, b.x1); if (gap > 1.5 * Math.max(a.h, b.h) || gap < -0.3 * Math.min(a.w, b.w)) continue;
-          ok = true; break; }
+function sBlobs(mask, w, h) {
+  const n = w * h, lab = new Int32Array(n), stack = new Int32Array(n), comps = [];
+  for (let s = 0; s < n; s++) {
+    if (!mask[s] || lab[s]) continue;
+    const id = comps.length + 1; let sp = 0; stack[sp++] = s; lab[s] = id;
+    let x0 = w, x1 = 0, y0 = h, y1 = 0, area = 0;
+    while (sp) {
+      const p = stack[--sp], x = p % w, y = (p / w) | 0; area++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy; if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx; if (xx < 0 || xx >= w) continue;
+          const q = yy * w + xx; if (mask[q] && !lab[q]) { lab[q] = id; stack[sp++] = q; }
+        }
       }
-      if (ok) { hs.push(a.h); ths.push(a.thick); }
-    });
-    hs.sort((a, b) => a - b); ths.sort((a, b) => a - b);
-    if (ths.length >= 8) thickL = ths[ths.length >> 1];
-    if (hs.length >= 8) L = hs[hs.length >> 1];
-    else { const h2 = pre.map(c => c.h).sort((a, b) => a - b); if (h2.length) L = h2[Math.floor(h2.length * 0.6)]; }
+    }
+    comps.push({ id, x0, x1, y0, y1, w: x1 - x0 + 1, h: y1 - y0 + 1, area, cx: (x0 + x1) / 2, cy: (y0 + y1) / 2 });
   }
-  // Trazo largo, fino y torcido: pliegue (una letra, aunque sea "I", "l" o "/", no es más alta que un renglón)
-  const isStroke = c => {
-    const len = c.major, thick = c.area / Math.max(1, len), horiz = c.ang < 3 || c.ang > 177, vert = Math.abs(c.ang - 90) < 12;
-    // una "C" o "(" grande es curva; una "I", "l" o "1" grande es vertical y no más alta que unas pocas letras
-    return len > (vert ? 3.2 : 2.2) * L && thick < sw * 1.9 && len > 6 * thick && !horiz && c.minor < 0.35 * len; // más cortas: ver isDiag
+  return { lab, comps };
+}
+// Tamaño típico de letra (alto de las manchas que parecen caracteres)
+// (mediana ponderada por tinta de las manchas compactas: los pedazos finos de arrugas pesan poco)
+function sCharHeight(comps, Hd) {
+  const solid = comps.filter(c => c.h >= 5 && c.h <= Hd * 0.06 && c.w <= c.h * 2.5 && c.area / Math.max(c.w, c.h) >= c.h * 0.2 && c.area / (c.w * c.h) >= 0.18);
+  if (solid.length < 25) return 0;
+  solid.sort((a, b) => a.h - b.h);
+  const tot = solid.reduce((t, c) => t + c.area, 0); let acc = 0;
+  for (const c of solid) { acc += c.area; if (acc >= tot * 0.55) return c.h; }
+  return solid[solid.length - 1].h;
+}
+/* Mediciones de renglón: las letras de cada palabra se unen en manchas horizontales y se sigue su línea central.
+   Devuelve el alto típico de letra (Hc) y, cada media letra, la inclinación local del renglón (recta en una ventana). */
+function sLineObs(ink, Wd, Hd, HcFixed) {
+  const n = Wd * Hd;
+  // Tinta con histéresis: núcleos oscuros que crecen por el borde del trazo (las letras finas no se parten)
+  const m = new Uint8Array(n), stk = new Int32Array(n); let sp = 0;
+  for (let i = 0; i < n; i++) if (ink[i] > 0.6) { m[i] = 1; stk[sp++] = i; }
+  while (sp) {
+    const p = stk[--sp], x = p % Wd;
+    if (x > 0 && !m[p - 1] && ink[p - 1] > 0.3) { m[p - 1] = 1; stk[sp++] = p - 1; }
+    if (x < Wd - 1 && !m[p + 1] && ink[p + 1] > 0.3) { m[p + 1] = 1; stk[sp++] = p + 1; }
+    if (p >= Wd && !m[p - Wd] && ink[p - Wd] > 0.3) { m[p - Wd] = 1; stk[sp++] = p - Wd; }
+    if (p + Wd < n && !m[p + Wd] && ink[p + Wd] > 0.3) { m[p + Wd] = 1; stk[sp++] = p + Wd; }
+  }
+  const { lab, comps } = sBlobs(m, Wd, Hd);
+  const Hc = HcFixed || sCharHeight(comps, Hd);
+  if (!Hc) return null;
+  // Solo manchas que pueden ser texto: fuera el código QR y los logos (muy grandes) y las arrugas (largas y finas)
+  const ok = new Uint8Array(comps.length + 1);
+  for (const c of comps) {
+    const len = Math.hypot(c.w, c.h), tau = c.area / Math.max(c.w, c.h);
+    ok[c.id] = c.area >= 3 && c.h <= Hc * 2.4 && c.w <= Hc * 6 && !(len > Hc * 2 && tau < Hc * 0.16) ? 1 : 0;
+  }
+  const T = new Uint8Array(n); for (let i = 0; i < n; i++) if (lab[i] && ok[lab[i]]) T[i] = 1;
+  // Las letras de una palabra o de un tramo de renglón se unen en una mancha horizontal (huecos cortos de cada fila)
+  const gap = Math.round(Hc * 1.1), B = T.slice();
+  for (let y = 0; y < Hd; y++) {
+    const r = y * Wd; let last = -1;
+    for (let x = 0; x < Wd; x++) if (T[r + x]) { if (last >= 0 && x - last > 1 && x - last <= gap) for (let k = last + 1; k < x; k++) B[r + k] = 1; last = x; }
+  }
+  const { lab: lb, comps: blobs } = sBlobs(B, Wd, Hd);
+  const obs = [], segs = [], byBlob = new Map();
+  for (const bl of blobs) if (bl.w >= Hc * 2.5 && bl.area / bl.w <= Hc * 2) byBlob.set(bl.id, { b: bl, sy: new Float32Array(bl.w), sn: new Float32Array(bl.w), ymin: new Float32Array(bl.w).fill(1e9), ymax: new Float32Array(bl.w).fill(-1) });
+  for (let y = 0; y < Hd; y++) for (let x = 0; x < Wd; x++) {
+    const i = y * Wd + x; if (!T[i]) continue;
+    const e = byBlob.get(lb[i]); if (!e) continue;
+    const k = x - e.b.x0; e.sy[k] += y; e.sn[k]++; if (y < e.ymin[k]) e.ymin[k] = y; if (y > e.ymax[k]) e.ymax[k] = y;
+  }
+  // Inclinación por la línea base (el borde inferior de las letras): letras grandes y chicas del mismo renglón comparten
+  // la base; las colas (p, g, q, y, coma) quedan por debajo y se descartan en un segundo ajuste.
+  const half = Math.max(4, Math.round(Hc * 2.6));
+  const fit = (pts, x) => { let s0 = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (const [px, py] of pts) { if (Math.abs(px - x) > half) continue; s0++; sx += px; sy += py; sxx += px * px; sxy += px * py; }
+    const den = s0 * sxx - sx * sx; if (s0 < Hc * 2 || den <= 0) return null;
+    const sl = (s0 * sxy - sx * sy) / den; return { sl, y0: (sy - sl * sx) / s0, n: s0 }; };
+  const ends = []; // extremos de cada tramo de renglón (para unir etiqueta y monto separados por un blanco)
+  for (const e of byBlob.values()) {
+    const { b: bl, sn, ymin, ymax } = e, pts = [];
+    for (let k = 0; k < bl.w; k++) if (sn[k] && ymax[k] - ymin[k] <= Hc * 1.8) pts.push([bl.x0 + k, ymax[k]]);
+    if (pts.length < Hc * 1.5) continue;
+    const line = [];
+    for (let k = 0; k < pts.length; k += Math.max(1, Math.round(Hc / 2))) {
+      const x = pts[k][0]; const f1 = fit(pts, x); if (!f1) continue;
+      const keep = pts.filter(([px, py]) => Math.abs(px - x) <= half && py <= f1.y0 + f1.sl * px + Hc * 0.2);
+      const f2 = fit(keep, x) || f1;
+      if (Math.abs(f2.sl) > 0.45) continue;
+      const yc = f2.y0 + f2.sl * x - Hc * 0.4;
+      obs.push({ x, y: yc, s: f2.sl, w: Math.min(3, f2.n / (Hc * 2)) }); line.push([x, yc, f2.sl]);
+    }
+    if (line.length) { segs.push(line); const a = line[0], z = line[line.length - 1]; ends.push({ xa: Math.max(bl.x0, a[0] - half), ya: a[1] + a[2] * (Math.max(bl.x0, a[0] - half) - a[0]), sa: a[2], xb: Math.min(bl.x1, z[0] + half), yb: z[1] + z[2] * (Math.min(bl.x1, z[0] + half) - z[0]), sb: z[2] }); }
+  }
+  // Puentes: un tramo y el siguiente a su derecha en el mismo renglón (prolongando la inclinación de ambos extremos).
+  // Si la pareja es clara, el blanco entre ellos debe subir o bajar justo lo que se mide: así no se descuadran columnas.
+  const bridges = [];
+  for (const A of ends) {
+    const cand = [];
+    for (const B of ends) {
+      const gap = B.xa - A.xb; if (B === A || gap < Hc * 0.8 || gap > Wd * 0.75) continue;
+      const err = Math.abs(B.ya - (A.yb + (A.sb + B.sa) / 2 * gap)); if (err < Hc * 1.6) cand.push({ B, gap, err });
+    }
+    if (!cand.length) continue;
+    const g0 = Math.min(...cand.map(c => c.gap)), near = cand.filter(c => c.gap <= g0 + Hc * 2).sort((p, q) => p.err - q.err);
+    if (near[0].err < Hc * 0.4 && (near.length < 2 || near[1].err > Hc * 0.9)) bridges.push({ x1: A.xb, x2: near[0].B.xa, y: (A.yb + near[0].B.ya) / 2, m: (near[0].B.ya - A.yb) / (near[0].B.xa - A.xb) });
+  }
+  return { Hc, obs, segs, bridges };
+}
+/* Malla de inclinaciones: tramos lineales a lo ancho (6) y a lo largo (cada ~2 renglones), ajustada con suavidad y
+   pesos robustos (lo que no encaja pesa menos). El desplazamiento D(x, y) es la inclinación acumulada desde el centro de
+   la hoja: cada columna baja o sube lo necesario para que el renglón quede horizontal. Se limita cuánto puede cambiar la
+   altura de los renglones (sin pliegues ni letras estiradas). */
+function sSolveBanded(A, b, M, bw) { // A: filas de 2·bw+1 (simétrica definida positiva), sin pivoteo
+  const W2 = 2 * bw + 1, at = (i, j) => i * W2 + (j - i + bw);
+  for (let k = 0; k < M; k++) {
+    const piv = A[at(k, k)]; if (!(Math.abs(piv) > 1e-12)) return null;
+    for (let i = k + 1; i <= Math.min(M - 1, k + bw); i++) {
+      const fct = A[at(i, k)] / piv; if (!fct) continue;
+      for (let j = k; j <= Math.min(M - 1, k + bw); j++) A[at(i, j)] -= fct * A[at(k, j)];
+      b[i] -= fct * b[k];
+    }
+  }
+  const x = new Float64Array(M);
+  for (let i = M - 1; i >= 0; i--) { let t = b[i]; for (let j = i + 1; j <= Math.min(M - 1, i + bw); j++) t -= A[at(i, j)] * x[j]; x[i] = t / A[at(i, i)]; }
+  return x;
+}
+function sSlopeModel(obs, Wd, Hd, Hc, bridges = []) {
+  const NX = 7, Kx = Wd / (NX - 1), Ky = Math.max(8, Hc * 2), NY = Math.ceil(Hd / Ky) + 1, M = NX * NY, bw = 2 * NX, W2 = 2 * bw + 1;
+  const hat = (v, K, N) => { const f = Math.max(0, Math.min(N - 1.0001, v / K)), a = Math.floor(f); return [a, 1 - (f - a), f - a]; };
+  const at4 = (x, y) => { const [a, x0, x1] = hat(x, Kx, NX), [bb, y0, y1] = hat(y, Ky, NY); return [[bb * NX + a, x0 * y0], [bb * NX + a + 1, x1 * y0], [(bb + 1) * NX + a, x0 * y1], [(bb + 1) * NX + a + 1, x1 * y1]]; };
+  // Un puente es la inclinación media a lo largo del blanco (promedio de 12 puntos): cuenta como una medición más
+  const brObs = bridges.map(b => { const acc = new Map(); for (let m = 0; m < 12; m++) for (const [k, v] of at4(b.x1 + (m + 0.5) * (b.x2 - b.x1) / 12, b.y)) acc.set(k, (acc.get(k) || 0) + v / 12); return { x: (b.x1 + b.x2) / 2, y: b.y, s: b.m, w: 3, nd: [...acc] }; });
+  obs = obs.concat(brObs);
+  const nodes = obs.map(o => o.nd || at4(o.x, o.y));
+  const sAt = (c, nd) => nd.reduce((t, [k, w]) => t + c[k] * w, 0);
+  // D a partir de los valores en los nodos: integral (exacta, por trapecios) desde la columna central
+  const makeD = c => {
+    const ac = (NX - 1) / 2;
+    return (x, y) => {
+      const [bb, y0, y1] = hat(y, Ky, NY), S = k => c[bb * NX + k] * y0 + c[(bb + 1) * NX + k] * y1;
+      const fx = Math.max(0, Math.min(NX - 1, x / Kx)), a = Math.min(NX - 2, Math.floor(fx)), t = fx - a;
+      let D = 0;
+      if (a >= ac) { for (let k = ac; k < a; k++) D += Kx * (S(k) + S(k + 1)) / 2; }
+      else { for (let k = a + 1; k < ac; k++) D -= Kx * (S(k) + S(k + 1)) / 2; D -= Kx * (S(a) + S(a + 1)) / 2; }
+      const s0 = S(a), s1 = S(a + 1); return D + Kx * (s0 * t + (s1 - s0) * t * t / 2);
+    };
   };
-  // Mancha maciza (sombra de un pliegue): gruesa y con forma de hoja (llena poco su recuadro). Una "M" negrita o un
-  // cuadrito del QR son gruesos pero llenan su recuadro
-  const isBlob = c => c.thick > Math.max(3.5, thickL + 2, 1.8 * thickL) * Math.max(1, c.h / (1.6 * L)) && c.area / (c.w * c.h) < 0.6;
-  // Raya diagonal fina (marca de pliegue o "/"): se decide aparte, mirando si está entre letras como un "/"
-  const isDiag = c => { const a = c.ang; return c.major <= 2.2 * L && c.major > 3.2 * Math.max(1, c.minor) && ((a > 18 && a < 75) || (a > 105 && a < 162)); };
-  const cand = pre.filter(c => !isStroke(c) && !isBlob(c) && !isDiag(c) && c.h <= 5 * L);
-  // Renglones: unir letras vecinas de alto parecido y centradas a la misma altura (sirve para cualquier tamaño)
-  const cell = Math.max(8, Math.round(L * 2)), gw = Math.ceil(w / cell) + 1, grid = new Map();
-  cand.forEach((c, i) => { const k = ((c.cy / cell) | 0) * gw + ((c.cx / cell) | 0); if (!grid.has(k)) grid.set(k, []); grid.get(k).push(i); });
-  const par = cand.map((_, i) => i), find = i => { while (par[i] !== i) { par[i] = par[par[i]]; i = par[i]; } return i; };
-  const deg = new Uint16Array(cand.length), edges = [];
-  cand.forEach((a, i) => {
-    const R = Math.ceil((a.w / 2 + Math.max(a.h, L) * 3.2 + 2.5 * L) / cell), gx = (a.cx / cell) | 0, gy = (a.cy / cell) | 0; // palabras pegadas: piezas anchas
-    for (let yy = gy - 1; yy <= gy + 1; yy++) for (let xx = gx - R; xx <= gx + R; xx++) {
-      const lst = grid.get(yy * gw + xx); if (!lst) continue;
-      for (const j of lst) {
-        if (j <= i) continue; const b = cand[j];
-        const hr = Math.max(a.h, b.h) / Math.min(a.h, b.h); if (hr > 1.9) continue;
-        const hm = Math.max(a.h, b.h);
-        if (Math.abs(a.cy - b.cy) > 0.42 * hm && Math.abs(a.y1 - b.y1) > 0.25 * hm) continue; // misma línea base o mismo centro
-        const gap = Math.max(a.x0, b.x0) - Math.min(a.x1, b.x1);
-        if (gap > 3.0 * hm) continue;
-        if (gap < -0.5 * Math.min(a.w, b.w)) continue; // encimadas: no son letras vecinas
-        par[find(i)] = find(j); deg[i]++; deg[j]++; edges.push(i, j);
-      }
+  let wts = obs.map(o => o.w), reg = 1, c = null;
+  for (let it = 0; it < 10; it++) {
+    const A = new Float64Array(M * W2), b = new Float64Array(M), at = (i, j) => i * W2 + (j - i + bw);
+    let wsum = 0;
+    obs.forEach((o, i) => { const nd = nodes[i], wi = wts[i]; wsum += wi;
+      for (const [p, vp] of nd) { b[p] += wi * vp * o.s; for (const [q, vq] of nd) A[at(p, q)] += wi * vp * vq; } });
+    const per = wsum / M, ly = per * reg * 0.1, lx = per * reg * 0.05, mu = per * 0.002;
+    for (let k = 0; k < M; k++) A[at(k, k)] += mu;
+    for (let bb = 0; bb < NY; bb++) for (let a = 0; a < NX; a++) {
+      if (bb > 0 && bb < NY - 1) { const id = [(bb - 1) * NX + a, bb * NX + a, (bb + 1) * NX + a], cf = [1, -2, 1]; for (let p = 0; p < 3; p++) for (let q = 0; q < 3; q++) A[at(id[p], id[q])] += ly * cf[p] * cf[q]; }
+      if (a > 0 && a < NX - 1) { const id = [bb * NX + a - 1, bb * NX + a, bb * NX + a + 1], cf = [1, -2, 1]; for (let p = 0; p < 3; p++) for (let q = 0; q < 3; q++) A[at(id[p], id[q])] += lx * cf[p] * cf[q]; }
     }
-  });
-  const gsize = new Map(); cand.forEach((_, i) => { const r = find(i); gsize.set(r, (gsize.get(r) || 0) + 1); });
-  const groups = new Map();
-  cand.forEach((c, i) => { const r = find(i); if (gsize.get(r) >= 2) { c.keep = 1; c.grp = r; if (!groups.has(r)) groups.set(r, []); groups.get(r).push(c); } });
-  // Gráficos compactos y oscuros (QR, logos, sellos)
-  for (const c of C) {
-    if (c.keep) continue;
-    const fill = c.area / (c.w * c.h);
-    if (c.h > 1.6 * L && c.w > 1.6 * L && fill > 0.28 && c.mn < 0.55 && c.w < c.h * 3 && c.h < c.w * 3 && c.thick <= 0.2 * Math.min(c.w, c.h) + 2) c.keep = 2;
+    c = sSolveBanded(A, b, M, bw); if (!c) return null;
+    const D = makeD(c);
+    let worst = 0;
+    for (let y = Ky; y < Hd - Ky; y += Ky / 3) for (let x = 0; x <= Wd; x += Wd / 12) worst = Math.max(worst, Math.abs((D(x, y + 2) - D(x, y - 2)) / 4));
+    if (worst > 0.6) { reg *= 2; continue; }
+    const res = obs.map((o, i) => o.s - sAt(c, nodes[i]));
+    const mad = res.map(Math.abs).sort((x, y) => x - y)[res.length >> 1] || 0.01;
+    wts = obs.map((o, i) => o.w / (1 + (res[i] / (4 * Math.max(0.01, mad))) ** 2));
+    if (it >= 3) break;
   }
-  // Rayas de separación: muchas rayitas bajas en una misma fila
-  const dashes = C.filter(c => !c.keep && c.h <= Math.max(sw * 2.6, 0.5 * L) && c.w >= c.h && c.w <= 3 * L && c.mn < 0.75);
-  if (dashes.length >= 3) {
-    dashes.sort((a, b) => a.cy - b.cy);
-    for (let i = 0; i < dashes.length;) {
-      let j = i; while (j + 1 < dashes.length && dashes[j + 1].cy - dashes[i].cy < 0.35 * L) j++;
-      const row = dashes.slice(i, j + 1), span = Math.max(...row.map(c => c.x1)) - Math.min(...row.map(c => c.x0));
-      if (row.length >= 3 && span >= 4 * L) for (const c of row) c.keep = 3;
-      i = j + 1;
+  return c ? makeD(c) : null;
+}
+// Mueve un mapa de tinta reducido con el desplazamiento (para medir el resultado antes de aplicarlo)
+function sWarpField(src, Wd, Hd, dyAt) {
+  const out = new Float32Array(Wd * Hd);
+  for (let y = 0; y < Hd; y++) for (let x = 0; x < Wd; x++) { const yy = y + dyAt(x, y), y0 = Math.floor(yy), fy = yy - y0; if (y0 < 0 || y0 >= Hd - 1) continue; out[y * Wd + x] = src[y0 * Wd + x] * (1 - fy) + src[(y0 + 1) * Wd + x] * fy; }
+  return out;
+}
+/* Renglones rígidos: dentro de cada renglón el desplazamiento casi no cambia de arriba abajo (las letras no se estiran ni
+   se encogen) y lo que haga falta estirar o encoger para dejar los renglones rectos se va al blanco entre renglones.
+   Por cada columna de la malla se resuelve un ajuste 1D: seguir el campo suave donde hay tinta, rígido dentro del
+   renglón y flexible en el blanco. La tinta se mide en una ventana ancha, así columnas vecinas no se rasgan. */
+function sRigidLines(G, GX, GY, gx, gy, fn, ink, Wd, Hd, Hc) {
+  const Wk = sWarpField(ink, Wd, Hd, fn), W1 = Wd + 1, II = new Float64Array(W1 * (Hd + 1));
+  for (let y = 0; y < Hd; y++) { let row = 0; for (let x = 0; x < Wd; x++) { if (Wk[y * Wd + x] > 0.5) row++; II[(y + 1) * W1 + x + 1] = II[y * W1 + x + 1] + row; } }
+  const G2 = new Float32Array(GX * GY), hw = Math.max(2, Math.round(Hc)), R = 60, kb = 0.05;
+  const c = new Float64Array(GY), k = new Float64Array(GY), dg = new Float64Array(GY), up = new Float64Array(GY), rhs = new Float64Array(GY);
+  for (let i = 0; i < GX; i++) {
+    const x = i * gx, xa = Math.max(0, Math.round(x - hw)), xb = Math.min(Wd, Math.round(x + hw));
+    for (let j = 0; j < GY; j++) {
+      const ya = Math.max(0, Math.round(j * gy - gy / 2)), yb = Math.min(Hd, Math.round(j * gy + gy / 2)), area = (xb - xa) * (yb - ya);
+      c[j] = area > 0 ? Math.min(1, (II[yb * W1 + xb] - II[ya * W1 + xb] - II[yb * W1 + xa] + II[ya * W1 + xa]) / area / 0.04) : 0;
+    }
+    for (let j = 0; j < GY - 1; j++) k[j] = R * Math.min(c[j], c[j + 1]) + kb;
+    // Sistema tridiagonal: (w + k_izq + k_der)·g_j − k_izq·g_(j−1) − k_der·g_(j+1) = w·G_j  (algoritmo de Thomas)
+    for (let j = 0; j < GY; j++) { const w = c[j] + 0.01, kl = j > 0 ? k[j - 1] : 0, kr = j < GY - 1 ? k[j] : 0; dg[j] = w + kl + kr; up[j] = -kr; rhs[j] = w * G[j * GX + i]; }
+    for (let j = 1; j < GY; j++) { const m = -k[j - 1] / dg[j - 1]; dg[j] -= m * up[j - 1]; rhs[j] -= m * rhs[j - 1]; }
+    let v = rhs[GY - 1] / dg[GY - 1]; G2[(GY - 1) * GX + i] = v;
+    for (let j = GY - 2; j >= 0; j--) { v = (rhs[j] - up[j] * v) / dg[j]; G2[j * GX + i] = v; }
+  }
+  return G2;
+}
+function scanDewarp(canvas, passes = 3) {
+  const W = canvas.width, H = canvas.height;
+  const { ink, Wd, Hd, f } = sInkSmall(canvas, 700);
+  const wmed = arr => { arr.sort((a, b) => a[0] - b[0]); const tot = arr.reduce((t, v) => t + v[1], 0); let acc = 0; for (const [v, ww] of arr) { acc += ww; if (acc >= tot / 2) return v; } return 0; };
+  let L0 = sLineObs(ink, Wd, Hd);
+  if (!L0 || L0.obs.length < 20) return canvas;
+  const Hc = L0.Hc, gx = Math.max(2, Hc / 3), gy = Math.max(2, Hc / 3), GX = Math.ceil(Wd / gx) + 1, GY = Math.ceil(Hd / gy) + 1;
+  const gridFn = G => (x, y) => { const fx = Math.max(0, Math.min(GX - 1.001, x / gx)), fy = Math.max(0, Math.min(GY - 1.001, y / gy)), i = fx | 0, j = fy | 0, ax = fx - i, ay = fy - j;
+    return (G[j * GX + i] * (1 - ax) + G[j * GX + i + 1] * ax) * (1 - ay) + (G[(j + 1) * GX + i] * (1 - ax) + G[(j + 1) * GX + i + 1] * ax) * ay; };
+  // Inclinación sistemática: promedio por celdas (el ruido de cada medición se cancela; lo que queda es el giro real)
+  const sys = L => { const cw = Hc * 5, ch = Hc * 3, cells = new Map();
+    for (const o of L.obs) { const k = Math.floor(o.x / cw) + ',' + Math.floor(o.y / ch), c = cells.get(k) || [0, 0]; c[0] += o.s * o.w; c[1] += o.w; cells.set(k, c); }
+    let a2 = 0, t = 0; for (const [sw, ww] of cells.values()) { if (ww < 2) continue; a2 += Math.abs(sw / ww) * ww; t += ww; } return t ? a2 / t : 0; };
+  // Varias pasadas sobre la imagen reducida (cada una mide lo que quedó torcido); al final se aplica una sola vez
+  let acc = null, accFn = null, tiltFirst = sys(L0), tiltLast = tiltFirst;
+  for (let pass = 0; pass < passes; pass++) {
+    const D = sSlopeModel(L0.obs, Wd, Hd, Hc, L0.bridges);
+    if (!D) break;
+    const G = new Float32Array(GX * GY);
+    for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) {
+      const x = i * gx, y = j * gy, d = Math.max(-Hd * 0.2, Math.min(Hd * 0.2, D(x, y)));
+      G[j * GX + i] = accFn ? d + accFn(x, y + d) : d; // la nueva corrección se suma a las anteriores
+    }
+    const fn = gridFn(G), L1 = sLineObs(sWarpField(ink, Wd, Hd, fn), Wd, Hd, Hc);
+    const t0 = sys(L0), t1 = L1 && L1.obs.length ? sys(L1) : 1;
+    const m0 = wmed(L0.obs.map(o => [Math.abs(o.s), o.w])), m1 = L1 && L1.obs.length ? wmed(L1.obs.map(o => [Math.abs(o.s), o.w])) : 1;
+    if (!(t0 > 0.02 && t1 < t0 * 0.85 && m1 <= m0 * 1.05 && L1.obs.length >= L0.obs.length * 0.6)) break;
+    acc = G; accFn = fn; L0 = L1; tiltLast = t1;
+  }
+  if (typeof window !== 'undefined' && window.SCAN_DEBUG) window.__dewarp = { Hc, Wd, Hd, f, segs: L0.segs, obs: L0.obs.length, tilt0: tiltFirst, tilt1: tiltLast, good: !!acc };
+  if (!acc) return canvas;
+  const dyAt = gridFn(sRigidLines(acc, GX, GY, gx, gy, accFn, ink, Wd, Hd, Hc));
+  // Aplicar a resolución completa (una sola vez)
+  const sctx = canvas.getContext('2d', { willReadFrequently: true }), sd = sctx.getImageData(0, 0, W, H).data;
+  const out = document.createElement('canvas'); out.width = W; out.height = H;
+  const octx = out.getContext('2d'), od = octx.createImageData(W, H), o = od.data;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const yy = y + dyAt(x / f, y / f) * f, y0 = Math.floor(yy), fy = yy - y0, oi = (y * W + x) * 4;
+      if (y0 < 0 || y0 >= H - 1) { o[oi] = o[oi + 1] = o[oi + 2] = 255; o[oi + 3] = 255; continue; }
+      const i0 = (y0 * W + x) * 4, i1 = i0 + W * 4;
+      o[oi] = sd[i0] * (1 - fy) + sd[i1] * fy; o[oi + 1] = sd[i0 + 1] * (1 - fy) + sd[i1 + 1] * fy; o[oi + 2] = sd[i0 + 2] * (1 - fy) + sd[i1 + 2] * fy; o[oi + 3] = 255;
     }
   }
-  // Líneas rectas impresas (subrayados, recuadros): largas, horizontales y de grosor parejo
-  for (const c of C) if (!c.keep && (c.ang < 2.5 || c.ang > 177.5) && c.w > 2 * L && c.h <= sw * 3.5 && c.mn < 0.6) c.keep = 4;
-  // Franja de cada renglón: se arma con cada par de letras vecinas (sigue renglones curvos y no mezcla renglones
-  // aunque un grupo haya unido dos). Lo que cae dentro puede ser letra pegada a un pliegue.
-  const band = new Int32Array(w * h).fill(-1), hhOf = new Map();
-  for (const [r, g] of groups) hhOf.set(r, g.map(c => c.h).sort((x, y) => x - y)[g.length >> 1]);
-  for (let e = 0; e < edges.length; e += 2) {
-    let a = cand[edges[e]], b = cand[edges[e + 1]]; if (a.cx > b.cx) { const t = a; a = b; b = t; }
-    const hh = hhOf.get(a.grp) || Math.max(a.h, b.h), ok = c => c.h <= 1.35 * hh;
-    // letra con cola de pliegue (más alta que el renglón): se usa la vecina como referencia
-    const A = ok(a) ? a : ok(b) ? b : null, B = ok(b) ? b : ok(a) ? a : null;
-    const xa = Math.max(0, Math.floor(a.cx - a.w / 2 - 0.6 * hh)), xb = Math.min(w - 1, Math.ceil(b.cx + b.w / 2 + 0.6 * hh)), span = Math.max(1, b.cx - a.cx);
-    for (let x = xa; x <= xb; x++) {
-      const t = Math.max(0, Math.min(1, (x - a.cx) / span));
-      let top, bot;
-      if (A && B) { top = A.y0 * (1 - t) + B.y0 * t; bot = A.y1 * (1 - t) + B.y1 * t; const mid = (top + bot) / 2; top = Math.min(top, mid - hh / 2); bot = Math.max(bot, mid + hh / 2); }
-      else { const cy = a.cy * (1 - t) + b.cy * t; top = cy - 0.6 * hh; bot = cy + 0.6 * hh; }
-      const ya = Math.max(0, Math.floor(top - 0.12 * hh)), yb = Math.min(h - 1, Math.ceil(bot + 0.12 * hh));
-      for (let y = ya; y <= yb; y++) band[y * w + x] = 1;
-    }
-  }
-  // "/" de una fecha o de "Placa/Codigo": entre dos letras a la misma altura y muy cerca de ambas
-  const kgrid = new Map(), kc = Math.max(8, Math.round(L * 2)), kgw = Math.ceil(w / kc) + 1;
-  for (const c of C) if (c.keep === 1) { const k = ((c.cy / kc) | 0) * kgw + ((c.cx / kc) | 0); if (!kgrid.has(k)) kgrid.set(k, []); kgrid.get(k).push(c); }
-  const slashOk = c => {
-    let left = false, right = false; const gx = (c.cx / kc) | 0, gy = (c.cy / kc) | 0;
-    for (let yy = gy - 1; yy <= gy + 1; yy++) for (let xx = gx - 2; xx <= gx + 2; xx++) for (const o of kgrid.get(yy * kgw + xx) || []) {
-      if (o.h < 0.55 * c.h || o.h > 1.4 * c.h || Math.abs(o.y1 - c.y1) > 0.3 * c.h) continue;
-      if (o.x1 <= c.x0 + 0.25 * c.w && c.x0 - o.x1 <= 0.6 * c.h) left = true;
-      if (o.x0 >= c.x1 - 0.25 * c.w && o.x0 - c.x1 <= 0.6 * c.h) right = true;
-    }
-    return left && right;
-  };
-  const inB = new Uint32Array(C.length + 1);
-  for (let p = 0; p < w * h; p++) if (lab[p] && band[p] >= 0) inB[lab[p]]++;
-  for (const c of C) {
-    if (c.keep) { if (c.keep === 1 && inB[c.id] < c.area * 0.85) c.clip = 1; continue; } // letra con cola de pliegue: solo lo del renglón
-    if (c.h < minH * 0.5 || !inB[c.id]) continue;
-    const fr = inB[c.id] / c.area; c.fr = fr;
-    if (isBlob(c) || (isDiag(c) && !slashOk(c))) continue;                       // mancha o raya de pliegue
-    if (fr > 0.85 && c.h <= 2.2 * L && !isStroke(c)) { c.keep = 5; continue; }   // suelta dentro del renglón (":", "1", "$", "/")
-    if (fr >= 0.15 && !isStroke(c) && c.mn < 0.62) { c.keep = 6; c.clip = 1; }  // pegada a un pliegue: solo la parte del renglón
-  }
-  const keepId = new Uint8Array(C.length + 1), clipId = new Uint8Array(C.length + 1), bc = new Float32Array(C.length + 1);
-  for (const c of C) { keepId[c.id] = c.keep; clipId[c.id] = c.clip ? 1 : 0; bc[c.id] = c.mn + 0.25 * (c.mean - c.mn); }
-  // Pliegue que atraviesa letras: se quitan los píxeles que forman una línea larga y recta en la dirección de la pieza
-  const cut = new Uint8Array(w * h);
-  for (const c of C) {
-    if (!(c.keep === 6 || (c.keep === 1 && c.clip))) continue;
-    const t = c.ang * Math.PI / 180, dx = Math.cos(t), dy = Math.sin(t), need = 1.3 * L, far = Math.ceil(3 * L);
-    const hit = [];
-    for (let y = c.y0; y <= c.y1; y++) for (let x = c.x0; x <= c.x1; x++) {
-      const p = y * w + x; if (lab[p] !== c.id) continue;
-      let run = 1;
-      for (let sgn = -1; sgn <= 1; sgn += 2) for (let k = 1; k < far; k++) {
-        const xx = Math.round(x + sgn * k * dx), yy = Math.round(y + sgn * k * dy);
-        if (xx < 0 || yy < 0 || xx >= w || yy >= h || lab[yy * w + xx] !== c.id) break; run++;
-      }
-      if (run >= need) hit.push(p);
-    }
-    for (const p of hit) { cut[p] = 1; const x = p % w;
-      for (const q of [p - 1, p + 1, p - w, p + w]) if (q >= 0 && q < w * h && lab[q] === c.id && Math.abs((q % w) - x) <= 1) cut[q] = 1; }
-  }
-  const out = new Uint8Array(w * h), left = new Uint32Array(C.length + 1);
-  for (let p = 0; p < w * h; p++) {
-    const id = lab[p]; if (!id) continue; const k = keepId[id]; if (!k) continue;
-    if (clipId[id] && band[p] < 0) continue;
-    if (cut[p]) continue;
-    out[p] = k; left[id]++;
-  }
-  // lo que queda de una pieza recortada y cortada: si son migajas, era pliegue
-  const crumbs = Math.max(12, 0.15 * L * L);
-  for (let p = 0; p < w * h; p++) { const id = lab[p]; if (out[p] && clipId[id] && left[id] < crumbs) out[p] = 0; }
-  if (typeof window !== 'undefined' && window.__scanDebug) Object.assign(window.__scanDebug, { C, slashOk, kgrid, kc, kgw });
-  return { mask: out, lab, bc, L, comps: C.length, kept: C.filter(c => c.keep).length };
+  octx.putImageData(od, 0, 0);
+  return out;
 }
 
-/* Limpieza tipo escáner: que la factura quede "como recién impresa" (v1.35).
-   1) Dedos pegados al borde → papel. Luz del papel en dos escalas: una amplia (sombras, luz cálida) y una fina del
-      tamaño de unos pocos trazos, que sigue cada faceta de un papel arrugado. Cada píxel se divide por su luz.
-   2) Umbral de tinta por zonas: cada zona usa lo más oscuro que tiene, así el texto gris de una tirilla desteñida
-      no desaparece aunque al lado haya un QR muy negro.
-   3) Solo se conserva lo impreso: letras agrupadas en renglones (alto parecido, misma línea, cerca una de otra),
-      QR y logos, rayas de separación y líneas rectas. Se descartan sombras macizas de los pliegues, rayas finas y
-      largas, y rayitas diagonales que no están entre letras como un "/". Una letra pegada a un pliegue se recorta a
-      su renglón y se le quita la línea recta del pliegue.
-   4) Tinta negra pareja sobre blanco puro (cada letra se oscurece según su propio tono) y restos del fondo fuera.
-   mode 'clean' → blanco y negro; 'color' → misma luminosidad conservando el tono de sellos y logos. */
+// Recorta el blanco sobrante alrededor del texto (queda un margen parejo)
+function scanTrim(canvas) {
+  const w = canvas.width, h = canvas.height, d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+  const rows = new Uint32Array(h), cols = new Uint32Array(w);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = (y * w + x) * 4; if (d[i] + d[i + 1] + d[i + 2] < 480) { rows[y]++; cols[x]++; } }
+  const minRow = Math.max(2, w * 0.004), minCol = Math.max(2, h * 0.002);
+  let y0 = 0, y1 = h - 1, x0 = 0, x1 = w - 1;
+  while (y0 < h && rows[y0] < minRow) y0++; while (y1 > y0 && rows[y1] < minRow) y1--;
+  while (x0 < w && cols[x0] < minCol) x0++; while (x1 > x0 && cols[x1] < minCol) x1--;
+  if (y1 - y0 < h * 0.2 || x1 - x0 < w * 0.2) return canvas; // casi vacío: no tocar
+  const m = Math.round(Math.max(x1 - x0, 200) * 0.06);
+  x0 = Math.max(0, x0 - m); y0 = Math.max(0, y0 - m); x1 = Math.min(w - 1, x1 + m); y1 = Math.min(h - 1, y1 + m);
+  const nw = x1 - x0 + 1, nh = y1 - y0 + 1;
+  if (nw * nh > w * h * 0.92) return canvas;
+  const out = document.createElement('canvas'); out.width = nw; out.height = nh;
+  out.getContext('2d').drawImage(canvas, x0, y0, nw, nh, 0, 0, nw, nh); return out;
+}
+function sSolve(A, b) { // Gauss con pivoteo; null si es singular
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++) { let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-12) return null; [M[c], M[p]] = [M[p], M[c]];
+    for (let r = 0; r < n; r++) { if (r === c) continue; const k = M[r][c] / M[c][c]; for (let j = c; j <= n; j++) M[r][j] -= k * M[c][j]; } }
+  return M.map((r, i) => r[n] / r[i]);
+}
+
+/* Limpieza tipo escáner.
+   - Dedos: piel pegada al borde → papel.
+   - Luz: se estima el brillo del papel sin texto (cierre morfológico a menor resolución + desenfoque) y se divide.
+     Eso aplana sombras y la parte ancha de los dobleces.
+   - Dobleces finos y manchas: lo que es solo "gris" (nunca tan oscuro como la tinta) y no está pegado a un trazo
+     de texto se vuelve blanco (umbral con histéresis).
+   mode 'clean' → blanco y negro; 'color' → color con la luz aplanada. */
+/* Limpieza tipo escáner de documentos (como Adobe Scan / Samsung):
+   1) Se estima la luz del papel en cada zona (cierre morfológico grande + suavizado): sombras, dobleces
+      suaves y luz desigual quedan en ese "fondo".
+   2) Cada píxel se divide por su fondo: el papel queda parejo y el texto conserva su forma y sus grises.
+   3) Se enfoca el texto (máscara de enfoque) y se ajustan niveles: el papel pasa a blanco puro y la tinta a
+      negro, sin binarizar, así el texto tenue (tirillas térmicas gastadas) no se borra.
+   4) Dedos que tapan el borde y restos del fondo se blanquean; las marcas de dobleces largas y finas se quitan. */
+/* "Recién impreso": en el modo mejorado se dibuja solo lo que tiene forma de impresión — letras ordenadas en renglones,
+   el código QR o logos compactos, y guiones o reglas horizontales (separadores). Sombras, dobleces y arrugas no tienen esa
+   estructura y quedan en blanco, también entre renglones. Devuelve 1 = se dibuja, 0 = papel (null si no hay texto claro). */
+function sTextKeep(sharp, w, h, darkAt, lightAt, margin, coreAbs) {
+  const n = w * h, D = new Uint8Array(n);
+  for (let i = 0; i < n; i++) D[i] = sharp[i] < darkAt(i) ? 1 : 0;
+  const { lab, comps } = sBlobs(D, w, h);
+  const Hc = sCharHeight(comps, h);
+  if (!Hc || comps.length < 30) return null;
+  const minV = new Float32Array(comps.length + 1).fill(9);
+  for (let i = 0; i < n; i++) if (lab[i] && sharp[i] < minV[lab[i]]) minV[lab[i]] = sharp[i];
+  const kind = new Uint8Array(comps.length + 1); // 1 letra, 2 gráfico, 3 guion o regla, 4 punto o tilde
+  for (const c of comps) {
+    const len = Math.hypot(c.w, c.h), tau = c.area / Math.max(c.w, c.h), dens = c.area / (c.w * c.h);
+    if (c.h >= Hc * 0.35 && c.h <= Hc * 2.4 && c.w <= Hc * 6 && c.area >= Hc * Hc * 0.05 && !(len > Hc * 2 && tau < Hc * 0.16) && !(c.h < Hc * 0.6 && c.w > Hc * 1.8)) kind[c.id] = 1;
+    else if (c.w >= Hc * 2 && c.h >= Hc * 2 && dens >= 0.3 && tau >= Hc * 0.3) kind[c.id] = 2;
+    else if (c.h <= Hc * 0.36 && c.w >= c.h * 1.5 && c.w <= Hc * 40) kind[c.id] = 3;
+    else if (c.area < Hc * Hc * 0.05) kind[c.id] = 4;
+  }
+  // Franja de renglón alrededor de cada letra (rectángulos sumados con una tabla de diferencias)
+  const ex = Math.round(Hc * 1.2), ey = Math.round(Hc * 0.35), acc = new Int32Array((w + 1) * (h + 1));
+  for (const c of comps) {
+    if (kind[c.id] !== 1) continue;
+    const x0 = Math.max(0, c.x0 - ex), x1 = Math.min(w, c.x1 + 1 + ex), y0 = Math.max(0, c.y0 - ey), y1 = Math.min(h, c.y1 + 1 + ey);
+    acc[y0 * (w + 1) + x0]++; acc[y0 * (w + 1) + x1]--; acc[y1 * (w + 1) + x0]--; acc[y1 * (w + 1) + x1]++;
+  }
+  for (let y = 0; y <= h; y++) for (let x = 1; x <= w; x++) acc[y * (w + 1) + x] += acc[y * (w + 1) + x - 1];
+  for (let y = 1; y <= h; y++) for (let x = 0; x <= w; x++) acc[y * (w + 1) + x] += acc[(y - 1) * (w + 1) + x];
+  // Guiones alineados (separadores "- - - -" o "====") y reglas largas: se conservan aunque estén lejos del texto
+  const dash = comps.filter(c => kind[c.id] === 3).sort((a, b) => a.cy - b.cy || a.x0 - b.x0), keepComp = new Uint8Array(comps.length + 1);
+  for (let i = 0; i < dash.length; i++) {
+    const row = [dash[i]];
+    for (let j = i + 1; j < dash.length && dash[j].cy - dash[i].cy <= Hc * 0.3; j++) row.push(dash[j]);
+    row.sort((a, b) => a.x0 - b.x0);
+    let run = [row[0]];
+    const flush = () => { const span = run[run.length - 1].x1 - run[0].x0; if ((run.length >= 3 && span >= Hc * 3) || span >= Hc * 4) run.forEach(c => { keepComp[c.id] = 1; }); };
+    for (let k = 1; k < row.length; k++) { if (row[k].x0 - run[run.length - 1].x1 <= Hc * 1.5) run.push(row[k]); else { flush(); run = [row[k]]; } }
+    flush();
+  }
+  // Oscuridad de referencia de cada renglón: la tinta más oscura de las letras vecinas del mismo renglón (rejilla gruesa).
+  // Una mancha mucho más clara que las letras de su renglón es sombra de un doblez; un renglón entero desteñido se conserva.
+  const cw = Math.max(2, Hc / 2), chh = Math.max(2, Hc), GXr = Math.ceil(w / cw) + 1, GYr = Math.ceil(h / chh) + 1, ref = new Float32Array(GXr * GYr).fill(9);
+  for (const c of comps) {
+    if (kind[c.id] !== 1) continue;
+    const gx0 = Math.max(0, Math.floor((c.x0 - Hc * 6) / cw)), gx1 = Math.min(GXr - 1, Math.floor((c.x1 + Hc * 6) / cw)), gy0 = Math.max(0, Math.floor((c.cy - Hc * 0.5) / chh)), gy1 = Math.min(GYr - 1, Math.floor((c.cy + Hc * 0.5) / chh));
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) { const k = gy * GXr + gx; if (minV[c.id] < ref[k]) ref[k] = minV[c.id]; }
+  }
+  const refAt = c => ref[Math.min(GYr - 1, Math.floor(c.cy / chh)) * GXr + Math.min(GXr - 1, Math.floor(c.cx / cw))];
+  const mX = Math.round(w * 0.04), mY = Math.round(h * 0.035), drop = new Uint8Array(comps.length + 1);
+  for (const c of comps) {
+    const len = Math.hypot(c.w, c.h), tau = c.area / Math.max(c.w, c.h), flat = c.h <= c.w * 0.27;
+    const atEdge = c.x0 < mX || c.y0 < mY || c.x1 >= w - mX || c.y1 >= h - mY;
+    const inTopBot = c.y0 < mY || c.y1 >= h - mY;
+    const r0 = refAt(c), lim = r0 < 9 ? Math.max(coreAbs, r0 + margin) : coreAbs;
+    if (minV[c.id] > lim && c.area < Hc * Hc * 2 && kind[c.id] !== 4) drop[c.id] = 1;  // nunca tan oscura como la tinta ni como su renglón: sombra o doblez (los puntos se salvan)
+    else if (atEdge && kind[c.id] !== 1) drop[c.id] = 1;                               // borde roto, sombra o fondo
+    else if (inTopBot && (c.h < Hc * 0.65 || c.w > Hc * 4)) drop[c.id] = 1;            // sombra plana del borde de arriba o de abajo
+    else if (kind[c.id] === 0 && !keepComp[c.id] && c.h < Hc * 0.6 && c.w > Hc * 1.8) drop[c.id] = 1; // mancha plana que no es separador
+    else if (kind[c.id] !== 1 && kind[c.id] !== 2 && !keepComp[c.id] && len > Hc * 1.2 && tau < Hc * 0.2 && !flat) drop[c.id] = 1; // raya de doblez
+  }
+  const K = new Uint8Array(n);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x; if (!D[i] || drop[lab[i]]) continue; const k = kind[lab[i]];
+    if (k === 2 || keepComp[lab[i]] || acc[y * (w + 1) + x] > 0) K[i] = 1;
+  }
+  // Letras completas: desde lo oscuro se crece por el gris del mismo trazo (unos píxeles), sin pasar a sombras lejanas
+  const R = K.slice(), gr = Math.max(1, Math.round(Hc * 0.15)), dist = new Uint8Array(n), q = [];
+  for (let i = 0; i < n; i++) if (K[i]) q.push(i);
+  for (let qi = 0; qi < q.length; qi++) {
+    const p = q[qi], x = p % w, dd = dist[p] + 1; if (dd > gr) continue;
+    for (const nb of [p - 1, p + 1, p - w, p + w]) {
+      if (nb < 0 || nb >= n || R[nb] || (nb === p - 1 && x === 0) || (nb === p + 1 && x === w - 1)) continue;
+      if (sharp[nb] < lightAt(nb)) { R[nb] = 1; dist[nb] = dd; q.push(nb); }
+    }
+  }
+  // y un píxel más para el borde suave
+  const R2 = R.slice();
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) { const i = y * w + x; if (!R[i] && (R[i - 1] || R[i + 1] || R[i - w] || R[i + w])) R2[i] = 1; }
+  if (typeof window !== 'undefined' && window.SCAN_DEBUG) window.__textKeep = { Hc, comps: comps.length, letters: comps.filter(c => kind[c.id] === 1).length };
+  R2.charH = Hc;
+  return R2;
+}
 function scanClean(canvas, mode) {
   const w = canvas.width, h = canvas.height, n = w * h;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -1065,7 +1219,7 @@ function scanClean(canvas, mode) {
     const rc = Math.max(1, Math.round(w / 250 / q)), fqC = sMorph(fq, wq, hq, rc, true), fqB = sMorph(fq, wq, hq, Math.max(2, Math.round(w / 45 / q)), true);
     for (let y = 0; y < h; y++) { const row = ((y / q) | 0) * wq; for (let x = 0; x < w; x++) { const j = row + ((x / q) | 0); fGrown[y * w + x] = fqC[j] ? 1 : 0; fBand[y * w + x] = fqB[j] ? 1 : 0; } }
   }
-  // 1) Luz del papel a baja resolución (sombras amplias, degradados)
+  // 1) Fondo (luz del papel) a baja resolución
   const gq = new Float32Array(wq * hq);
   for (let y = 0; y < hq; y++) for (let x = 0; x < wq; x++) { let t = 0, c = 0; for (let yy = y * q; yy < Math.min(h, y * q + q); yy++) for (let xx = x * q; xx < Math.min(w, x * q + q); xx++) { const i = yy * w + xx; t += fBand[i] ? 245 : g[i]; c++; } gq[y * wq + x] = t / c; }
   const rT = Math.max(3, Math.round(wq * 0.02)); // más ancho que cualquier trazo de letra
@@ -1073,64 +1227,41 @@ function scanClean(canvas, mode) {
   const bgq = sBoxBlur(closed, wq, hq, Math.max(2, Math.round(rT * 0.8)));
   const bgAt = (x, y) => { const fx = Math.max(0, Math.min(wq - 1.001, x / q - 0.5)), fy = Math.max(0, Math.min(hq - 1.001, y / q - 0.5)), x0 = fx | 0, y0 = fy | 0, ax = fx - x0, ay = fy - y0;
     return (bgq[y0 * wq + x0] * (1 - ax) + bgq[y0 * wq + x0 + 1] * ax) * (1 - ay) + (bgq[(y0 + 1) * wq + x0] * (1 - ax) + bgq[(y0 + 1) * wq + x0 + 1] * ax) * ay; };
-  const bgC = new Float32Array(n), gF = new Float32Array(n), ink0 = new Uint8Array(n);
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x, b = Math.max(30, bgAt(x, y)); bgC[i] = b; gF[i] = fGrown[i] ? b : g[i]; ink0[i] = !fGrown[i] && g[i] / b < 0.6 ? 1 : 0; }
-  // 2) Luz fina: sigue cada faceta del papel arrugado (cierre del tamaño de unos pocos trazos)
-  const { sw } = sInkScale(ink0, w, h);
-  const r1 = Math.max(2, Math.min(18, Math.round(sw * 1.7 + 1)));
-  let bgF = sMorph(sMorph(gF, w, h, r1, true), w, h, r1, false);
-  bgF = sBoxBlur(bgF, w, h, Math.max(1, r1 >> 1));
+  // 2) Luz pareja: cada píxel dividido por su fondo
   const bg = new Float32Array(n), nv = new Float32Array(n);
-  for (let i = 0; i < n; i++) { const b = Math.max(30, bgF[i], g[i], 0.88 * bgC[i]); bg[i] = b; nv[i] = fGrown[i] ? 1 : Math.min(1.1, g[i] / b); }
-  // 3) Umbrales de tinta según lo más oscuro de la factura (las tirillas desteñidas tienen la tinta gris)
-  const hist = new Uint32Array(111); let cnt = 0;
-  for (let i = 0; i < n; i += 2) { if (fGrown[i]) continue; hist[Math.max(0, Math.min(110, Math.round(nv[i] * 100)))]++; cnt++; }
-  const pct = f => { let a = 0; for (let b = 0; b <= 110; b++) { a += hist[b]; if (a >= cnt * f) return b / 100; } return 1; };
-  const p0 = Math.min(0.8, pct(0.004));
-  // Umbrales generosos (no partir letras tenues) y por zona: lo más oscuro de cada zona decide. Un QR muy
-  // negro no vuelve invisible el texto gris de al lado. Lo que no es texto lo quita el paso 4.
-  const tsOf = p => Math.max(0.6, Math.min(0.84, Math.max(0.58 + 0.25 * p, 0.5 + 0.5 * p)));
-  const cs = Math.max(12, Math.round(Math.min(w, h) / 36)), gxn = Math.ceil(w / cs), gyn = Math.ceil(h / cs), Pc = new Float32Array(gxn * gyn);
-  {
-    const hc = new Uint32Array(111);
-    for (let cy = 0; cy < gyn; cy++) for (let cx = 0; cx < gxn; cx++) {
-      hc.fill(0); let c = 0;
-      for (let y = cy * cs; y < Math.min(h, cy * cs + cs); y += 1) for (let x = cx * cs; x < Math.min(w, cx * cs + cs); x += 1) { const i = y * w + x; if (fGrown[i]) continue; hc[Math.max(0, Math.min(110, Math.round(nv[i] * 100)))]++; c++; }
-      let a = 0, pv = 1; if (c) for (let b = 0; b <= 110; b++) { a += hc[b]; if (a >= c * 0.02) { pv = b / 100; break; } }
-      Pc[cy * gxn + cx] = pv;
-    }
-  }
-  const TsC = new Float32Array(gxn * gyn);
-  for (let cy = 0; cy < gyn; cy++) for (let cx = 0; cx < gxn; cx++) {
-    // cada zona con tinta usa su propio nivel; una zona sin tinta toma el de sus vecinas (bordes de letras)
-    let m = Pc[cy * gxn + cx];
-    if (m > 0.8) for (let yy = Math.max(0, cy - 1); yy <= Math.min(gyn - 1, cy + 1); yy++) for (let xx = Math.max(0, cx - 1); xx <= Math.min(gxn - 1, cx + 1); xx++) m = Math.min(m, Pc[yy * gxn + xx]);
-    TsC[cy * gxn + cx] = tsOf(m);
-  }
-  const TsP = new Float32Array(n);
-  for (let y = 0; y < h; y++) {
-    const fy = Math.max(0, Math.min(gyn - 1.001, y / cs - 0.5)), y0 = fy | 0, ay = fy - y0, y1 = Math.min(gyn - 1, y0 + 1);
-    for (let x = 0; x < w; x++) {
-      const fx = Math.max(0, Math.min(gxn - 1.001, x / cs - 0.5)), x0 = fx | 0, ax = fx - x0, x1 = Math.min(gxn - 1, x0 + 1);
-      TsP[y * w + x] = (TsC[y0 * gxn + x0] * (1 - ax) + TsC[y0 * gxn + x1] * ax) * (1 - ay) + (TsC[y1 * gxn + x0] * (1 - ax) + TsC[y1 * gxn + x1] * ax) * ay;
-    }
-  }
-  const Ts = tsOf(p0), Tw = Math.min(0.92, Ts + 0.19); // valores globales, solo para depurar
-  // Enfoque suave: los trazos finos y tenues se oscurecen un poco respecto a su entorno
-  const nvb = sBoxBlur(nv, w, h, 1); for (let i = 0; i < n; i++) if (!fGrown[i]) nv[i] = Math.max(0, nv[i] + 0.6 * (nv[i] - nvb[i]));
-  const strong = new Float32Array(n); for (let i = 0; i < n; i++) strong[i] = nv[i] < TsP[i] ? 1 : 0;
-  const near = sMorph(strong, w, h, Math.max(1, Math.round(sw * 0.6)), true);
-  const ink = new Uint8Array(n); for (let i = 0; i < n; i++) ink[i] = strong[i] || (near[i] && nv[i] < Math.min(0.92, TsP[i] + 0.19)) ? 1 : 0;
-  // 4) Solo lo impreso: letras en renglones, rayas de separación, QR y logos
-  const pm = sPrintedMask(ink, nv, w, h, sw, fGrown);
-  if (typeof window !== 'undefined' && window.__scanDebug) Object.assign(window.__scanDebug, { sw, r1, Ts, Tw, p0, L: pm.L, comps: pm.comps, kept: pm.kept, mask: pm.mask, ink, w, h });
-  // 5) Tinta negra pareja sobre blanco (las letras desteñidas quedan oscuras y legibles)
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x, b = Math.max(30, bgAt(x, y)); bg[i] = b; nv[i] = fGrown[i] ? 1 : Math.min(1.15, g[i] / b); }
+  // 3) Enfoque: realza los bordes de las letras sin inflar el grano del papel
+  const sr = Math.max(1, Math.round(w / 900)), soft = sBoxBlur(nv, w, h, sr), sharp = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const dlt = nv[i] - soft[i]; sharp[i] = nv[i] + (Math.abs(dlt) > 0.02 ? 0.85 : 0.25) * dlt; }
+  // Niveles: blanco = papel típico; negro = la tinta más oscura (percentil bajo)
+  const hist = new Uint32Array(121); let cnt = 0;
+  const mx = Math.round(w * 0.06), my = Math.round(h * 0.05);
+  for (let y = my; y < h - my; y++) for (let x = mx + (y & 1); x < w - mx; x += 2) { const i = y * w + x; if (fGrown[i]) continue; hist[Math.max(0, Math.min(120, Math.round(sharp[i] * 100)))]++; cnt++; }
+  const pct = f => { let a = 0; for (let b = 0; b <= 120; b++) { a += hist[b]; if (a >= cnt * f) return b / 100; } return 1; };
+  const paper = pct(0.5), B = Math.min(0.5, Math.max(0.05, pct(0.004)));
+  const W = Math.max(B + 0.25, Math.min(0.93, paper - 0.07));
+  // En zonas que estaban en sombra el grano del papel se amplifica: ahí el blanco empieza un poco antes
+  const bgs = Float32Array.from(bgq).sort(), bgRef = bgs[Math.floor(bgs.length * 0.75)] || 255;
+  const Wat = i => Math.max(B + 0.2, W - 0.12 * (1 - Math.min(1, bg[i] / bgRef)));
+  // Curva que oscurece la tinta tenue (tirillas desteñidas) sin ensuciar el papel
+  const lv = (v, Wi) => { let t = (v - B) / (Wi - B); t = Math.max(0, Math.min(1, t)); return Math.pow(t, 1.8); };
+  // 4) Marcas de dobleces y arrugas: componentes muy largas y finas (no hay letras así), oscuras o tenues
+  const darkMask = new Float32Array(n); for (let i = 0; i < n; i++) darkMask[i] = sharp[i] < B + (Wat(i) - B) * 0.85 ? 1 : 0;
+  const tc0 = performance.now();
+  const crease = sFindCreases(darkMask, w, h);
+  const tc1 = performance.now();
+  const txt = mode === 'color' ? null : sTextKeep(sharp, w, h, i => B + (Wat(i) - B) * 0.55, i => B + (Wat(i) - B) * 0.85, (W - B) * 0.3, B + (W - B) * 0.38);
+  const tc2 = performance.now();
+  // un píxel de holgura alrededor de cada doblez (solo si hubo dobleces)
+  let creaseG = crease;
+  if (crease.some(v => v)) { creaseG = new Uint8Array(n); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x; if (crease[i] || (x > 0 && crease[i - 1]) || (x < w - 1 && crease[i + 1]) || (y > 0 && crease[i - w]) || (y < h - 1 && crease[i + w])) creaseG[i] = 1; } }
   const o = d;
   for (let i = 0; i < n; i++) {
-    let L = 255;
-    if (pm.mask[i]) { const ts = TsP[i], tw = Math.min(0.92, ts + 0.19), Bi = Math.min(ts - 0.12, Math.max(0.02, pm.bc[pm.lab[i]])); let t = (nv[i] - Bi) / (tw - Bi); t = t < 0 ? 0 : t > 1 ? 1 : t; L = Math.round(Math.pow(t, 1.5) * 255); }
+    // junto al dedo solo sobrevive la tinta clara y oscura del texto (no la sombra ni la piel)
+    const white = fGrown[i] || creaseG[i] || (txt && !txt[i]) || (fBand[i] && (skin[i] || sharp[i] > B + (Wat(i) - B) * 0.45));
+    const L = white ? 255 : Math.round(lv(sharp[i], Wat(i)) * 255);
     if (mode === 'color' && L < 255) {
-      // Color: misma luminosidad del modo mejorado; se conserva el tono original (sellos, logos, tinta azul)
+      // Color: la luminosidad es la misma del modo mejorado; se conserva el tono original (sellos, logos, tinta azul)
       const k = 255 / Math.max(30, bg[i]), f = [0, 1, 2].map(c => Math.min(255, d[i * 4 + c] * wb[c] * k)), fl = 0.299 * f[0] + 0.587 * f[1] + 0.114 * f[2];
       for (let c = 0; c < 3; c++) o[i * 4 + c] = Math.max(0, Math.min(255, Math.round(L + (f[c] - fl) * 1.15 * (1 - L / 255))));
     } else { o[i * 4] = o[i * 4 + 1] = o[i * 4 + 2] = L; }
@@ -1156,9 +1287,72 @@ function scanClean(canvas, mode) {
   }
   const out = document.createElement('canvas'); out.width = w; out.height = h;
   out.getContext('2d').putImageData(id, 0, 0);
-  return { canvas: out, fingers: C.sum(Array.from(finger)) };
+  if (typeof window !== 'undefined' && window.SCAN_DEBUG) window.__cleanT = { creases: Math.round(tc1 - tc0), textKeep: Math.round(tc2 - tc1) };
+  return { canvas: out, fingers: C.sum(Array.from(finger)), charH: txt ? txt.charH : 0 };
 }
 
+/* Dobleces y arrugas: líneas largas, finas y suaves que cruzan la hoja. Se busca la curva del doblez dentro de
+   cada componente larga y se borran solo los puntos finos sobre esa curva; las letras que la cruzan se conservan
+   (su trazo vertical es mucho más alto que el grosor del doblez). */
+function sFindCreases(mask, w, h) {
+  const n = w * h, lab = new Int32Array(n), stack = new Int32Array(n), out = new Uint8Array(n);
+  const t = Math.max(2, Math.round(w / 300)); // grosor máximo de un doblez
+  let id = 0;
+  for (let s0 = 0; s0 < n; s0++) {
+    if (!mask[s0] || lab[s0]) continue;
+    id++; let sp = 0; stack[sp++] = s0; lab[s0] = id; const px = []; let x0 = w, x1 = 0, y0 = h, y1 = 0;
+    while (sp) { const p = stack[--sp]; px.push(p); const x = p % w, y = (p / w) | 0;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (const q of [p - 1, p + 1, p - w, p + w, p - w - 1, p - w + 1, p + w - 1, p + w + 1]) { if (q < 0 || q >= n || !mask[q] || lab[q]) continue; if (Math.abs((q % w) - x) > 1) continue; lab[q] = id; stack[sp++] = q; } }
+    const horiz = (x1 - x0) >= (y1 - y0), span = horiz ? x1 - x0 : y1 - y0;
+    if (span < (horiz ? w : h) * 0.18) continue; // los dobleces tenues llegan partidos en tramos
+    // Posición del doblez en cada columna (o fila): la mediana de los puntos de la componente
+    const L = span + 1, buckets = Array.from({ length: L }, () => []);
+    for (const p of px) { const x = p % w, y = (p / w) | 0; if (horiz) buckets[x - x0].push(y); else buckets[y - y0].push(x); }
+    const pts = [];
+    for (let k = 0; k < L; k += 2) { const b = buckets[k]; if (!b.length) continue; b.sort((a, c) => a - c); pts.push([k, b[b.length >> 1]]); }
+    if (pts.length < L * 0.25) continue;
+    // Ajuste robusto de una curva suave (parábola) a esas posiciones
+    let coef = null, use = pts;
+    for (let it = 0; it < 3; it++) {
+      let S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], R = [0, 0, 0];
+      for (const [k, v] of use) { const u = k / L, f = [1, u, u * u]; for (let a = 0; a < 3; a++) { R[a] += f[a] * v; for (let c = 0; c < 3; c++) S[a][c] += f[a] * f[c]; } }
+      coef = sSolve(S, R); if (!coef) break;
+      const res = use.map(([k, v]) => Math.abs(v - (coef[0] + coef[1] * k / L + coef[2] * (k / L) ** 2)));
+      const lim = Math.max(t * 1.5, res.slice().sort((a, b) => a - b)[Math.floor(res.length * 0.6)] * 2);
+      use = use.filter((_, i) => res[i] <= lim);
+    }
+    if (!coef) continue;
+    const at = k => coef[0] + coef[1] * k / L + coef[2] * (k / L) ** 2;
+    // ¿Es de verdad una línea? La mayoría de columnas debe tener un punto sobre la curva
+    let on = 0, tot = 0;
+    for (let k = 0; k < L; k++) { const b = buckets[k]; if (!b.length) continue; tot++; if (b.some(v => Math.abs(v - at(k)) <= t * 1.5)) on++; }
+    if (tot < L * 0.5 || on / tot < 0.75) continue;
+    // Recorrido real del doblez (sigue curvas suaves, no solo la parábola), suavizado
+    const raw = new Array(L).fill(NaN);
+    for (let k = 0; k < L; k++) { const c = at(k), b = buckets[k].filter(v => Math.abs(v - c) <= t * 4); if (b.length) raw[k] = b[b.length >> 1]; }
+    let last = NaN; for (let k = 0; k < L; k++) { if (Number.isFinite(raw[k])) last = raw[k]; else raw[k] = Number.isFinite(last) ? last : at(k); }
+    const cen = raw.map((_, k) => { let s = 0, m = 0; for (let j = Math.max(0, k - 12); j <= Math.min(L - 1, k + 12); j++) { s += raw[j]; m++; } return s / m; });
+    // Borrar solo los puntos finos sobre el doblez, y solo donde no hay texto cerca
+    const near = new Uint8Array(L), Hn = t * 6;
+    for (let k = 0; k < L; k++) { const c = cen[k]; if (buckets[k].some(v => Math.abs(v - c) > t * 2.5 && Math.abs(v - c) <= Hn)) near[k] = 1; }
+    const nearW = new Uint8Array(L); for (let k = 0; k < L; k++) if (near[k]) for (let j = Math.max(0, k - Hn); j <= Math.min(L - 1, k + Hn); j++) nearW[j] = 1;
+    for (let k = 0; k < L; k++) {
+      if (nearW[k]) continue;
+      const c = Math.round(cen[k]);
+      for (let dv = -t * 2; dv <= t * 2; dv++) {
+        const v = c + dv, x = horiz ? x0 + k : v, y = horiz ? v : y0 + k;
+        if (x < 0 || y < 0 || x >= w || y >= h) continue;
+        const p = y * w + x; if (lab[p] !== id) continue;
+        let run = 1;
+        if (horiz) { for (let yy = y - 1; yy >= 0 && mask[yy * w + x]; yy--) run++; for (let yy = y + 1; yy < h && mask[yy * w + x]; yy++) run++; }
+        else { for (let xx = x - 1; xx >= 0 && mask[y * w + xx]; xx--) run++; for (let xx = x + 1; xx < w && mask[y * w + xx]; xx++) run++; }
+        if (run <= t * 2.2) out[p] = 1;
+      }
+    }
+  }
+  return out;
+}
 // Quita de la máscara de tinta las componentes que son líneas largas y finas (dobleces marcados)
 function sCleanLongStrokes(mask, w, h) {
   const n = w * h, lab = new Int32Array(n), stack = new Int32Array(n); let id = 0;
@@ -1440,17 +1634,36 @@ function scanProcess(src, quad, curve, userCurve, mode, det) {
       ctx.putImageData(id, 0, 0);
     }
   }
-  const level = scanDeskew(warped).canvas; // gira el texto si viene inclinado
-  let straight = level; for (let i = 0; i < 4; i++) { const nx = scanStraighten(straight); if (nx === straight) break; straight = nx; } // endereza renglones (hasta 4 pasadas, solo si mejora)
-  const res = scanClean(straight, mode || 'clean'); res.canvas = scanTrim(res.canvas);
+  const T = [performance.now()];
+  let level = scanDeskew(warped).canvas; T.push(performance.now()); // gira el texto si viene inclinado
+  const pre = level; level = scanDewarp(level, 3); T.push(performance.now()); // endereza cada renglón (papel arrugado), hasta 3 pasadas
+  let straight = level; for (let i = 0; i < 4; i++) { const nx = scanStraighten(straight); if (nx === straight) break; straight = nx; } T.push(performance.now()); // endereza renglones (hasta 4 pasadas, solo si mejora)
+  const res = scanClean(straight, mode || 'clean'); T.push(performance.now()); res.canvas = scanTrim(res.canvas);
+  if (level !== pre) { res.flatSrc = pre; res.flatMode = mode || 'clean'; } // para una lectura de respaldo sin enderezar renglones
+  if (typeof window !== 'undefined' && window.SCAN_DEBUG) window.__scanT = { deskew: Math.round(T[1] - T[0]), dewarp: Math.round(T[2] - T[1]), straighten: Math.round(T[3] - T[2]), clean: Math.round(T[4] - T[3]) };
   return res;
 }
-// Lado mayor del resultado: ~5 millones de píxeles como máximo, sin inventar más resolución de la que tiene la foto
+// Copia para el lector de texto: con letras pequeñas (menos de ~26 px de alto) lee mucho mejor si se amplía
+// La misma foto sin enderezar renglones: si la primera lectura queda incompleta, se lee también esta y se combinan
+function scanFlat(res) {
+  if (!res || !res.flatSrc) return null;
+  let s = res.flatSrc; for (let i = 0; i < 4; i++) { const nx = scanStraighten(s); if (nx === s) break; s = nx; }
+  const r2 = scanClean(s, res.flatMode || 'clean'); r2.canvas = scanTrim(r2.canvas); return r2;
+}
+function scanForOcr(res) {
+  const cv = res.canvas, hc = res.charH || 0;
+  const k = hc ? Math.max(1, Math.min(2.5, 26 / hc)) : 1;
+  if (k < 1.15 || cv.width * k * cv.height * k > 16e6) { res.ocrScale = 1; return cv; }
+  const o = document.createElement('canvas'); o.width = Math.round(cv.width * k); o.height = Math.round(cv.height * k);
+  const x = o.getContext('2d'); x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high'; x.drawImage(cv, 0, 0, o.width, o.height);
+  res.ocrScale = o.width / cv.width; return o;
+}
+// Lado mayor del resultado: ~3,5 millones de píxeles y 3000 px como máximo (≈300 ppp en una tirilla), sin inventar más resolución de la que tiene la foto
 function scanTargetSide(src, quad) {
   const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
   const qw = (d(quad[0], quad[1]) + d(quad[3], quad[2])) / 2, qh = (d(quad[0], quad[3]) + d(quad[1], quad[2])) / 2;
   const long = Math.max(qw, qh), short = Math.max(1, Math.min(qw, qh)), aspect = long / short;
-  return Math.round(Math.max(1600, Math.min(long * 1.15, Math.sqrt(5e6 * aspect), 4000)));
+  return Math.round(Math.max(1600, Math.min(long * 1.15, Math.sqrt(3.5e6 * aspect), 3000)));
 }
 async function scanFinish() {
   const btn = $('.sc-done', SC.el); if (btn) { btn.disabled = true; btn.innerHTML = 'Procesando…'; }
@@ -1460,7 +1673,7 @@ async function scanFinish() {
     const res = scanProcess(SC.src, SC.quad, SC.curve, SC.userCurve, SC.mode, moved || SC.userCurve ? null : SC.det);
     const done = SC.onDone, src = SC.src, quad = SC.quad.map(p => p.slice()), curve = JSON.parse(JSON.stringify(SC.curve)), mode = SC.mode, userCurve = SC.userCurve;
     closeScanner();
-    if (done) await done({ canvas: res.canvas, src, quad, curve, userCurve, mode, fingers: res.fingers });
+    if (done) await done({ canvas: res.canvas, src, quad, curve, userCurve, mode, fingers: res.fingers, charH: res.charH, flatSrc: res.flatSrc, flatMode: res.flatMode });
   } catch (e) { toast('No se pudo procesar la foto. Intenta de nuevo.'); if (btn) { btn.disabled = false; btn.innerHTML = 'Usar'; } }
 }
 document.addEventListener('click', e => {

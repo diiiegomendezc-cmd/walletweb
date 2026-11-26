@@ -177,6 +177,35 @@ def curl(img, rng):
     return out
 
 
+def crumple(img, rng):
+    """Papel arrugado: pliegues (quiebres con sombra a un lado y brillo al otro) y ondas pequeñas en todas direcciones.
+    Los renglones quedan torcidos distinto en cada parte, como una tirilla que estuvo en un bolsillo."""
+    from scipy import ndimage
+    a = np.array(img.convert('RGB'), np.float32); h, w = a.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    dx = np.zeros((h, w), np.float32); dy = np.zeros((h, w), np.float32); shade = np.ones((h, w), np.float32)
+    for _ in range(rng.randint(8, 16)):
+        ang = rng.uniform(0, math.pi); nx, ny = math.cos(ang), math.sin(ang)
+        cx, cy = rng.uniform(0, w), rng.uniform(0, h)
+        d = (xx - cx) * nx + (yy - cy) * ny                         # distancia con signo al pliegue
+        step = 1 / (1 + np.exp(np.clip(-d / rng.uniform(1.5, 4), -60, 60)))  # quiebre suave
+        amp = rng.uniform(1.5, 7) * rng.choice([-1, 1])
+        tx, ty = -ny, nx                                            # el papel se corre a lo largo y de lado
+        k = rng.uniform(-0.6, 0.6)
+        dx += step * amp * (nx + k * tx); dy += step * amp * (ny + k * ty)
+        sg = rng.uniform(3, 30); s1 = rng.uniform(0.04, 0.22)
+        shade *= np.where(d > 0, 1 - s1 * np.exp(np.clip(-d / sg, -60, 0)), 1 + s1 * 0.4 * np.exp(np.clip(d / (sg * 0.6), -60, 0)))
+    nz = np.random.default_rng(rng.randint(0, 9 ** 9))
+    for amp, cell in ((rng.uniform(4, 11), rng.randint(90, 200)), (rng.uniform(2, 5), rng.randint(50, 90)), (rng.uniform(0.5, 1.5), rng.randint(15, 35))):
+        gh, gw = h // cell + 2, w // cell + 2
+        dx += ndimage.zoom(nz.normal(0, amp, (gh, gw)), (h / gh, w / gw), order=3)[:h, :w]
+        dy += ndimage.zoom(nz.normal(0, amp, (gh, gw)), (h / gh, w / gw), order=3)[:h, :w]
+    blot = ndimage.zoom(nz.normal(0, 0.05, (h // 40 + 2, w // 40 + 2)), (h / (h // 40 + 2), w / (w // 40 + 2)), order=3)[:h, :w]
+    out = np.stack([ndimage.map_coordinates(a[..., c], [yy + dy, xx + dx], order=1, mode='nearest') for c in range(3)], -1)
+    out = out * (shade * (1 + blot))[..., None]
+    return Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
+
 def persp_coeffs(dst, src):
     A, B = [], []
     for (x, y), (X, Y) in zip(dst, src):
@@ -287,10 +316,12 @@ def draw_hand(rng, quad, layer_rgba):
     return col, a, ap
 
 
-def make_sample(idx, seed, prefix='syn_'):
+def make_sample(idx, seed, prefix='syn_', crumpled=False):
     rng = random.Random(seed)
     lines, fields = make_content(rng)
     paper, boxes, lh = render_paper(rng, lines)
+    if crumpled:
+        paper = crumple(paper, rng)
     pw, ph = paper.size
     cur = curl(paper, rng)
     cw, chh = cur.size
@@ -357,9 +388,12 @@ def make_sample(idx, seed, prefix='syn_'):
 
 
 if __name__ == '__main__':
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
-    seed0 = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
-    prefix = sys.argv[3] if len(sys.argv) > 3 else 'syn_'
+    # python3 gen.py N SEMILLA [PREFIJO] [--arrugada]
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    n = int(args[0]) if len(args) > 0 else 10
+    seed0 = int(args[1]) if len(args) > 1 else 1000
+    prefix = args[2] if len(args) > 2 else 'syn_'
+    crumpled = '--arrugada' in sys.argv
     for i in range(n):
-        m = make_sample(i, seed0 + i, prefix)
+        m = make_sample(i, seed0 + i, prefix, crumpled)
         print(m['name'], m['bg'], 'mano' if m['hand'] else '', 'cortada' if m['cut_bottom'] else '')

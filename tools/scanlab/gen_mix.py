@@ -21,6 +21,7 @@ BOLDISH = ['/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf', '/usr/sha
            '/usr/share/fonts/truetype/freefont/FreeMonoBold.ttf', '/usr/share/texmf/fonts/opentype/public/lm/lmmonolt10-bold.otf']
 SERIF = ['/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf',
          '/usr/share/fonts/truetype/freefont/FreeSerif.ttf']
+THIN, BOLDISH, SERIF = [[f for f in L if os.path.exists(f)] for L in (THIN, BOLDISH, SERIF)]  # solo las fuentes de esta máquina
 MALLS = ['LAS PALMAS', 'EL ROBLE', 'SAN MARCOS', 'LOS ALPES', 'LA COLINA', 'EL PORVENIR', 'SANTA ANA', 'LOS CEDROS', 'PUERTA REAL', 'LAS AMERICAS']
 BRANDS = ['MONTERO', 'ALDANA', 'BRAVO', 'SALAZAR', 'NAVARRO', 'GALEANO', 'ROSALES', 'QUINTERO', 'ARANGO', 'TOBON']
 FAKE = ['LOPEZ RIOS ANDREA', 'GARCIA MORA PABLO', 'RAMIREZ SOTO LAURA', 'CASTRO VEGA JULIAN', 'MORALES DIAZ CAMILA', 'HERRERA PAEZ SANTIAGO']

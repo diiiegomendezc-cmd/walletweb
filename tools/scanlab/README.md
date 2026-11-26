@@ -18,11 +18,16 @@ node run_detect.js mix_ && python3 eval_detect.py mix_   # solo la detección de
 node debug_clean.js /tmp/dbg imgs/mix_003.jpg            # resultado + máscara: verde = se conserva, rojo = se borra
 node capture_pre.js /tmp/dbg imgs/mix_003.jpg           # el recorte justo antes de limpiar (pre_mix_003.png)
 node debug_pre.js /tmp/dbg /tmp/dbg/pre_mix_003.png --box x0,y0,x1,y1   # limpieza de ese recorte y medidas de cada pieza
+python3 gen.py 60 777000 val_          # 60 fotos nuevas para validar (prefijo val_)
+python3 gen.py 30 5000 arr_ --arrugada # 30 tirillas arrugadas: pliegues con sombra y renglones torcidos
 node run_one.js imgs/mi_foto.jpg       # una foto real: guarda out/mi_foto.png y muestra lo leído
 node reparse.js mix_ && python3 evaluate.py mix_         # re-interpreta los textos ya leídos sin volver a escanear
 ```
 
 Éxito = recorte correcto (IoU ≥ 0,85) + sin restos de fondo o dedos + ≥ 85 % del texto visible legible + total correcto.
+Resultados de la versión 1.32.0: 92 % en el conjunto de ajuste (semillas 2000–2039) y 95 % en 60 fotos nuevas (semillas 777000+).
+Versión 1.35.0: 95 % y 97 %; en 30 tirillas arrugadas (`arr_`, semillas 5000+) 30 % de éxito (v1.34: 17 %), total correcto 76 % (62 %),
+fecha 87 % (67 %), tienda 67 % (47 %) e IVA 80 % (igual). El evaluador usa la lectura final (`parsed`: dos pasadas + respaldo).
 
 ## Resultados (v1.35.0)
 

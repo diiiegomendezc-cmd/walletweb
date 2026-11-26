@@ -30,20 +30,27 @@ window.runScan = async (url, opts = {}) => {
   out.png = res.canvas.toDataURL('image/png');
   if (opts.ocr !== false) {
     const w = await getWorker(); const t3 = performance.now();
-    const { data } = await w.recognize(res.canvas, {}, { text: true, blocks: true });
+    const ocv = typeof scanForOcr === 'function' ? scanForOcr(res) : res.canvas; out.ocrW = ocv.width;
+    const { data } = await w.recognize(ocv, {}, { text: true, blocks: true });
     out.msOcr = Math.round(performance.now() - t3);
     out.text = data.text; out.conf = data.confidence;
     out.parsedT6 = C.parseReceiptText(data.text);
     out.parsedG6 = C.parseReceiptText(C.receiptLinesFromWords(ocrWords(data)).join('\n'));
     if (opts.second !== false) {
       await w.setParameters({ tessedit_pageseg_mode: '11' }); const t4 = performance.now();
-      const d2 = (await w.recognize(res.canvas, {}, { text: true, blocks: true })).data;
+      const d2 = (await w.recognize(ocv, {}, { text: true, blocks: true })).data;
       await w.setParameters({ tessedit_pageseg_mode: '6' }); out.msOcr2 = Math.round(performance.now() - t4);
       out.lines11 = C.receiptLinesFromWords(ocrWords(d2)); out.parsedG11 = C.parseReceiptText(out.lines11.join('\n'));
       out.parsedM = C.mergeReceiptReads(out.parsedT6, out.parsedG11);
       out.parsedM3 = C.mergeReceiptReads(C.mergeReceiptReads(out.parsedT6, out.parsedG6), out.parsedG11);
     }
     out.parsed = out.parsedM || out.parsedT6;
+    // Igual que la app: si falta algo, lectura de respaldo de la foto sin enderezar renglones
+    const P = out.parsed, sumOk = x => x.total && x.items.length && Math.abs(x.items.reduce((t, i) => t + i.amount, 0) + (x.tip || 0) + (x.shipping || 0) - (x.discount || 0) - x.total) <= 1;
+    if ((!P.total || !P.tax || !sumOk(P) || !P.date || !P.merchant) && res.flatSrc && typeof scanFlat === 'function') {
+      const t5 = performance.now(), fr = scanFlat(res); const d3 = (await w.recognize(scanForOcr(fr), {}, { text: true })).data;
+      out.textFlat = d3.text; out.parsedFlat = C.parseReceiptText(d3.text); out.parsed = C.mergeReceiptReads(P, out.parsedFlat); out.msFlat = Math.round(performance.now() - t5);
+    }
   }
   return out;
 };
