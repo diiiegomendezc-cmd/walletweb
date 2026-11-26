@@ -195,7 +195,7 @@ async function useScan(res) {
   const pdf = await buildReceiptPdf(jpeg, cv.width, cv.height, []);
   if (D._thumbUrl) URL.revokeObjectURL(D._thumbUrl);
   D._thumbBlob = thumb; D._thumbUrl = URL.createObjectURL(thumb); D._scanJpeg = jpeg; D._scanSize = [cv.width, cv.height]; D._pdfWords = null;
-  D._scan = { src: res.src, quad: res.quad, curve: res.curve, userCurve: res.userCurve };
+  D._scan = { src: res.src, quad: res.quad, curve: res.curve, userCurve: res.userCurve, manual: res.manual };
   D.receiptBlob = pdf;
   D.receiptMeta = { name: 'Factura.pdf', type: 'application/pdf', size: pdf.size, hash: D._srcHash || await blobHash(jpeg), scanned: true, mode: res.mode };
   D._srcHash = null;

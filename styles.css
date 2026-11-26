@@ -413,6 +413,9 @@ table.it-view tfoot td { border-bottom: 0; }
 .sc-shutter { --p: 0; width: 76px; height: 76px; border-radius: 50%; border: 0; padding: 0; background: conic-gradient(#fff calc(var(--p) * 360deg), rgba(255, 255, 255, .35) 0); display: grid; place-items: center; }
 .sc-shutter span { width: 62px; height: 62px; border-radius: 50%; background: #fff; border: 3px solid #000; }
 .sc-shutter:active span { transform: scale(.92); }
+.sc-manual-row { display: flex; justify-content: center; padding: 8px 14px 0; }
+.sc-manual { gap: 6px; display: flex; align-items: center; }
+.sc-manual[aria-pressed="true"] { background: #fff; color: #000; }
 .sc-bar2 { display: flex; gap: 10px; align-items: center; padding: 10px 14px 14px; }
 .sc-bar2 .sc-seg { flex: 1; background: rgba(255, 255, 255, .12); border-color: rgba(255, 255, 255, .2); }
 .sc-bar2 .sc-seg button { color: rgba(255, 255, 255, .75); }

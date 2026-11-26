@@ -1439,7 +1439,7 @@ function openScanner(onDone, preset) {
   SC.onDone = onDone; SC.auto = S.settings.scanAuto !== false; SC.mode = S.settings.scanMode || 'clean';
   const el = document.createElement('div'); el.className = 'scanner'; el.setAttribute('role', 'dialog'); el.setAttribute('aria-modal', 'true'); el.setAttribute('aria-label', 'Escanear factura');
   document.body.appendChild(el); SC.el = el; document.body.style.overflow = 'hidden';
-  if (preset) { scanEditor(preset.canvas, preset.quad, preset.curve, preset.userCurve); return; }
+  if (preset) { scanEditor(preset.canvas, preset.quad, preset.curve, preset.userCurve, preset.manual); return; }
   el.innerHTML = `<div class="sc-top"><button class="sc-btn" data-sc="close" aria-label="Cerrar">${ic('x')}</button><div class="sc-title">Escanear factura</div><button class="sc-btn sc-auto" data-sc="auto" aria-pressed="${SC.auto}">Auto</button></div>
     <div class="sc-stage"><video playsinline muted autoplay></video><canvas class="sc-ov"></canvas><div class="sc-msg" role="status">Abriendo la cámara…</div></div>
     <div class="sc-hint">Pon la tirilla estirada sobre una superficie oscura. ${SC.auto ? 'Se toma sola cuando la detecta quieta.' : 'Toca el botón para tomarla.'}</div>
@@ -1518,15 +1518,18 @@ async function scanShot(quad) {
   scanEditor(cv, quad || null);
 }
 // Pantalla para ajustar el recorte: esquinas (círculos grandes) y curvatura de cada borde (círculos pequeños del medio)
-function scanEditor(canvas, quad, curve, userCurve) {
+function scanEditor(canvas, quad, curve, userCurve, manual) {
   SC.src = canvas;
-  SC.det = null; SC.autoQuad = null;
-  if (!curve) { const a = scanAutoDetect(canvas); if (a.quad) { quad = a.quad; curve = a.curve; SC.det = a.det; SC.autoQuad = a.quad.map(p => p.slice()); } } // detección fina sobre la foto tomada
+  SC.det = null; SC.autoQuad = null; SC.autoInit = null; SC.manual = !!manual;
+  if (!curve && !manual) { const a = scanAutoDetect(canvas); if (a.quad) { quad = a.quad; curve = a.curve; SC.det = a.det; SC.autoQuad = a.quad.map(p => p.slice()); } } // detección fina sobre la foto tomada
   SC.quad = (quad || scanFullQuad(canvas.width, canvas.height)).map(p => p.slice());
   SC.curve = curve ? JSON.parse(JSON.stringify(curve)) : curveZero(); SC.userCurve = !!userCurve;
+  if (!manual) SC.autoInit = { quad: SC.quad.map(p => p.slice()), curve: JSON.parse(JSON.stringify(SC.curve)) };
+  if (SC.manual) scanSetRect(quad ? sQuadBox(SC.quad) : scanStartRect());
   SC.el.innerHTML = `<div class="sc-top"><button class="sc-btn" data-sc="retake" aria-label="Repetir">${ic('left')}</button><div class="sc-title">Ajusta el recorte</div><button class="sc-btn" data-sc="rotate" aria-label="Rotar">${ic('repeat')}</button></div>
     <div class="sc-stage"><canvas class="sc-edit" aria-label="Foto con el recorte. Arrastra las esquinas para ajustarlo."></canvas></div>
-    <div class="sc-hint">Círculos grandes: esquinas. Puntos pequeños: arrástralos para seguir la forma del papel.</div>
+    <div class="sc-hint"></div>
+    <div class="sc-manual-row"><button type="button" class="sc-btn sc-manual" data-sc="manual"></button></div>
     <div class="sc-bar2"><div class="seg sc-seg" role="group" aria-label="Acabado">${[['clean', 'Mejorada'], ['color', 'Color']].map(([v, l]) => `<button type="button" data-sc="mode" data-v="${v}" aria-pressed="${SC.mode === v}">${l}</button>`).join('')}</div>
       <button class="btn primary sc-done" data-sc="done">${ic('check', 'sm')} Usar</button></div>`;
   const ec = $('.sc-edit', SC.el);
@@ -1535,12 +1538,17 @@ function scanEditor(canvas, quad, curve, userCurve) {
     const [px, py] = pos(e), t = SC.view; if (!t) return;
     let best = -1, bd = 34;
     scanHandles().forEach((hd, i) => { const dd = Math.hypot(t.ox + hd.x * t.k - px, t.oy + hd.y * t.k - py) - (i < 4 ? 6 : 0); if (dd < bd) { bd = dd; best = i; } });
-    if (best >= 0) { SC.drag = best; SC.dragH = scanHandles()[best]; if (best >= 4) SC.userCurve = true; SC.base = JSON.parse(JSON.stringify(SC.curve)); ec.setPointerCapture(e.pointerId); e.preventDefault(); }
+    if (best < 0 && SC.manual) { // rectángulo manual: tocar adentro y arrastrar lo mueve entero
+      const sx = (px - t.ox) / t.k, sy = (py - t.oy) / t.k, r = SC.rect;
+      if (sx > r.x0 && sx < r.x1 && sy > r.y0 && sy < r.y1) { best = 8; SC.moveFrom = { sx, sy, r: { ...r } }; }
+    }
+    if (best >= 0) { SC.drag = best; SC.dragH = best < 8 ? scanHandles()[best] : null; if (best >= 4 && !SC.manual) SC.userCurve = true; SC.base = JSON.parse(JSON.stringify(SC.curve)); ec.setPointerCapture(e.pointerId); e.preventDefault(); }
   });
   ec.addEventListener('pointermove', e => {
     if (SC.drag < 0) return; const [px, py] = pos(e), t = SC.view;
     const sx = Math.max(0, Math.min(SC.src.width, (px - t.ox) / t.k)), sy = Math.max(0, Math.min(SC.src.height, (py - t.oy) / t.k));
-    if (SC.drag < 4) SC.quad[SC.drag] = [sx, sy];
+    if (SC.manual) scanRectDrag(SC.drag, sx, sy, (px - t.ox) / t.k, (py - t.oy) / t.k);
+    else if (SC.drag < 4) SC.quad[SC.drag] = [sx, sy];
     else {
       // punto de borde: deforma solo su tramo (campana que llega a cero en los puntos vecinos)
       const hd = SC.dragH, key = hd.key, s0 = hd.s, half = hd.half;
@@ -1553,10 +1561,51 @@ function scanEditor(canvas, quad, curve, userCurve) {
   });
   const up = () => { SC.drag = -1; drawEditor(); };
   ec.addEventListener('pointerup', up); ec.addEventListener('pointercancel', up);
+  scanEditorUI();
   requestAnimationFrame(drawEditor);
+}
+/* Recorte manual en rectángulo (capturas de pantalla, o cuando la detección automática se equivoca): el recorte es un
+   rectángulo recto que se ajusta con las esquinas, los lados o arrastrándolo; la imagen se recorta tal cual, sin
+   enderezar renglones ni quitar dedos. */
+function scanEditorUI() {
+  const h = $('.sc-hint', SC.el), b = $('.sc-manual', SC.el); if (!h || !b) return;
+  h.textContent = SC.manual ? 'Arrastra las esquinas o los lados del rectángulo. Toca adentro y arrastra para moverlo.' : 'Círculos grandes: esquinas. Puntos pequeños: arrástralos para seguir la forma del papel.';
+  b.setAttribute('aria-pressed', String(SC.manual));
+  b.innerHTML = SC.manual ? `${ic('repeat', 'sm')} Volver al recorte automático` : `${ic('edit', 'sm')} Ajustar a mano (rectángulo)`;
+}
+function sQuadBox(q) { const xs = q.map(p => p[0]), ys = q.map(p => p[1]); return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) }; }
+function scanStartRect() { const w = SC.src.width, h = SC.src.height, m = Math.round(Math.min(w, h) * 0.03); return { x0: m, y0: m, x1: w - m, y1: h - m }; }
+function scanSetRect(r) {
+  const w = SC.src.width, h = SC.src.height;
+  r = { x0: Math.max(0, Math.min(w, r.x0)), y0: Math.max(0, Math.min(h, r.y0)), x1: Math.max(0, Math.min(w, r.x1)), y1: Math.max(0, Math.min(h, r.y1)) };
+  if (r.x1 - r.x0 < 8 || r.y1 - r.y0 < 8) r = scanStartRect();
+  SC.rect = r; SC.quad = [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]]; SC.curve = curveZero(); SC.userCurve = false;
+}
+// drag: 0–3 esquinas (como en SC.quad), 4–7 lados (arriba, derecha, abajo, izquierda), 8 mover todo
+function scanRectDrag(drag, sx, sy, rx, ry) {
+  const r = { ...SC.rect }, w = SC.src.width, h = SC.src.height, min = Math.max(24, Math.min(w, h) * 0.04);
+  if (drag === 8) {
+    const f = SC.moveFrom, bw = f.r.x1 - f.r.x0, bh = f.r.y1 - f.r.y0;
+    r.x0 = Math.max(0, Math.min(w - bw, f.r.x0 + rx - f.sx)); r.y0 = Math.max(0, Math.min(h - bh, f.r.y0 + ry - f.sy)); r.x1 = r.x0 + bw; r.y1 = r.y0 + bh;
+  } else {
+    const L = drag === 0 || drag === 3 || drag === 7, R = drag === 1 || drag === 2 || drag === 5, T = drag === 0 || drag === 1 || drag === 4, B = drag === 2 || drag === 3 || drag === 6;
+    if (L) r.x0 = Math.min(sx, r.x1 - min); if (R) r.x1 = Math.max(sx, r.x0 + min);
+    if (T) r.y0 = Math.min(sy, r.y1 - min); if (B) r.y1 = Math.max(sy, r.y0 + min);
+  }
+  SC.rect = r; SC.quad = [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]];
+}
+function scanToggleManual() {
+  if (SC.manual) {
+    SC.manual = false;
+    if (!SC.autoInit) { const a = scanAutoDetect(SC.src); SC.det = a.det; SC.autoQuad = a.quad ? a.quad.map(p => p.slice()) : null; SC.autoInit = { quad: (a.quad || scanFullQuad(SC.src.width, SC.src.height)).map(p => p.slice()), curve: a.curve || curveZero() }; }
+    SC.quad = SC.autoInit.quad.map(p => p.slice()); SC.curve = JSON.parse(JSON.stringify(SC.autoInit.curve)); SC.userCurve = false;
+  } else { SC.manual = true; scanSetRect(scanStartRect()); }
+  scanEditorUI(); drawEditor();
 }
 // Puntos de control: 0–3 esquinas; después varios puntos por borde (más en los bordes largos) para dar formas irregulares
 function scanHandles() {
+  if (SC.manual) { const r = SC.rect, mx = (r.x0 + r.x1) / 2, my = (r.y0 + r.y1) / 2;
+    return [...SC.quad.map(([x, y]) => ({ x, y, corner: true })), { x: mx, y: r.y0 }, { x: r.x1, y: my }, { x: mx, y: r.y1 }, { x: r.x0, y: my }]; }
   const H = sHomography(UNIT, SC.quad), k = SC.view ? SC.view.k : 1, out = SC.quad.map(([x, y]) => ({ x, y, corner: true }));
   const len = (a, b) => Math.hypot(SC.quad[a][0] - SC.quad[b][0], SC.quad[a][1] - SC.quad[b][1]) * k;
   const edges = [['t', len(0, 1)], ['r', len(1, 2)], ['b', len(3, 2)], ['l', len(0, 3)]];
@@ -1612,9 +1661,14 @@ function sWarpMask(mask, quad, curve, W, H) {
 }
 // Procesamiento completo de "Usar": recorte con perspectiva/curva, enderezado y limpieza.
 // det: detección automática; si el recorte no se movió a mano, todo lo que no es papel (dedos, mano, fondo) queda en blanco.
-function scanProcess(src, quad, curve, userCurve, mode, det) {
+function scanProcess(src, quad, curve, userCurve, mode, det, manual) {
   quad = quad || scanFullQuad(src.width, src.height); curve = curve || curveZero();
   const side = scanTargetSide(src, quad);
+  if (manual) { // rectángulo manual: recorte tal cual (una captura de pantalla ya está derecha)
+    const crop = scanWarp(src, quad, side, curveZero()), res = scanClean(crop, mode || 'clean');
+    res.flatSrc = crop; res.flatMode = mode || 'clean';
+    return res;
+  }
   let warped = scanWarp(src, quad, side, curve), used = curve;
   // Si la curva vino de la detección (no la tocaste), se verifica que de verdad mejore: con bordes mal medidos
   // la curva podría torcer el texto en "S". Se queda la versión con renglones más nítidos.
@@ -1972,10 +2026,10 @@ async function scanFinish() {
   await new Promise(r => setTimeout(r, 30));
   try {
     const moved = !SC.autoQuad || SC.quad.some((p, i) => Math.hypot(p[0] - SC.autoQuad[i][0], p[1] - SC.autoQuad[i][1]) > 2);
-    const res = scanProcess(SC.src, SC.quad, SC.curve, SC.userCurve, SC.mode, moved || SC.userCurve ? null : SC.det);
-    const done = SC.onDone, src = SC.src, quad = SC.quad.map(p => p.slice()), curve = JSON.parse(JSON.stringify(SC.curve)), mode = SC.mode, userCurve = SC.userCurve;
+    const res = scanProcess(SC.src, SC.quad, SC.curve, SC.userCurve, SC.mode, moved || SC.userCurve || SC.manual ? null : SC.det, SC.manual);
+    const done = SC.onDone, src = SC.src, quad = SC.quad.map(p => p.slice()), curve = JSON.parse(JSON.stringify(SC.curve)), mode = SC.mode, userCurve = SC.userCurve, manual = !!SC.manual;
     closeScanner();
-    if (done) await done({ canvas: res.canvas, src, quad, curve, userCurve, mode, fingers: res.fingers, charH: res.charH, flatSrc: res.flatSrc, flatMode: res.flatMode });
+    if (done) await done({ canvas: res.canvas, src, quad, curve, userCurve, manual, mode, fingers: res.fingers, charH: res.charH, flatSrc: res.flatSrc, flatMode: res.flatMode });
   } catch (e) { toast('No se pudo procesar la foto. Intenta de nuevo.'); if (btn) { btn.disabled = false; btn.innerHTML = 'Usar'; } }
 }
 document.addEventListener('click', e => {
@@ -1985,14 +2039,15 @@ document.addEventListener('click', e => {
   if (a === 'auto') { SC.auto = !SC.auto; S.settings.scanAuto = SC.auto; save(); b.setAttribute('aria-pressed', String(SC.auto)); SC.stable = 0; const h = $('.sc-hint', SC.el); if (h) h.textContent = 'Pon la tirilla estirada sobre una superficie oscura. ' + (SC.auto ? 'Se toma sola cuando la detecta quieta.' : 'Toca el botón para tomarla.'); }
   if (a === 'shot') scanShot(SC.last);
   if (a === 'retake') { const cb = SC.onDone; openScanner(cb); }
-  if (a === 'rotate') { SC.det = null; SC.autoQuad = null; const r = scanRotate(SC.src, SC.quad, SC.curve); SC.src = r.canvas; SC.quad = r.quad; SC.curve = r.curve; drawEditor(); }
+  if (a === 'rotate') { SC.det = null; SC.autoQuad = null; SC.autoInit = null; const r = scanRotate(SC.src, SC.quad, SC.curve); SC.src = r.canvas; SC.quad = r.quad; SC.curve = r.curve; if (SC.manual) scanSetRect(sQuadBox(SC.quad)); drawEditor(); }
+  if (a === 'manual') scanToggleManual();
   if (a === 'mode') { SC.mode = b.dataset.v; S.settings.scanMode = SC.mode; save(); $$('[data-sc="mode"]', SC.el).forEach(x => x.setAttribute('aria-pressed', String(x.dataset.v === SC.mode))); }
   if (a === 'done') scanFinish();
 });
 document.addEventListener('change', async e => {
   if (!e.target.matches('[data-sc-file]') || !SC.el) return;
   const f = e.target.files && e.target.files[0]; e.target.value = ''; if (!f) return;
-  try { const cv = await imageFileToCanvas(f, 4200); stopCamera(); scanEditor(cv, null); }
+  try { const cv = await imageFileToCanvas(f, 4200); stopCamera(); scanEditor(cv, null, null, false, f.type === 'image/png'); } // PNG = captura de pantalla: empieza con el rectángulo manual
   catch (er) { toast('No se pudo abrir la imagen.'); }
 });
 window.addEventListener('resize', () => { if (SC.el && $('.sc-edit', SC.el)) drawEditor(); });
@@ -2068,7 +2123,7 @@ document.addEventListener('click', async e => {
   const a = b.dataset.vw;
   if (a === 'close') closeViewer();
   else if (a === 'zoom') { const st = $('.vw-stage', VW.el).getBoundingClientRect(); vwZoomAt(VW.s > 1.05 ? 1 : 2.5, st.left + st.width / 2, st.top + st.height / 3, true); }
-  else if (a === 'adjust') { closeViewer(); if (D?._scan) openScanner(useScan, { canvas: D._scan.src, quad: D._scan.quad, curve: D._scan.curve, userCurve: D._scan.userCurve }); }
+  else if (a === 'adjust') { closeViewer(); if (D?._scan) openScanner(useScan, { canvas: D._scan.src, quad: D._scan.quad, curve: D._scan.curve, userCurve: D._scan.userCurve, manual: D._scan.manual }); }
   else if (a === 'share') {
     const o = VW.opts; try { await navigator.share({ files: [new File([o.pdf], o.name || 'Factura.pdf', { type: 'application/pdf' })], title: o.name || 'Factura' }); } catch (err) { if (err?.name !== 'AbortError') toast('No se pudo compartir.'); }
   }
