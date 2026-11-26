@@ -103,6 +103,27 @@ test('presupuesto: estados y proyección', () => {
   assert.equal(C.budgetStatus({ method: 'pctExpected', value: 0 }, 0, ctx, 80).state, 'nodata');
 });
 
+test('presupuesto: vigencia por meses', () => {
+  const b = { fromMonth: '2026-11', untilMonth: C.budgetUntil('2026-11', 'months', 3) };
+  assert.equal(b.untilMonth, '2027-01');
+  assert.equal(C.budgetActive(b, '2026-10'), false);
+  assert.equal(C.budgetActive(b, '2026-11'), true);
+  assert.equal(C.budgetActive(b, '2027-01'), true);
+  assert.equal(C.budgetActive(b, '2027-02'), false);
+  assert.equal(C.budgetActive({ value: 1 }, '2020-01'), true); // sin fechas (anteriores): siempre
+  assert.equal(C.budgetActive({ fromMonth: '2026-11', archived: true }, '2026-11'), false);
+  assert.equal(C.budgetUntil('2026-11', 'once'), '2026-11');
+  assert.equal(C.budgetUntil('2026-11', 'forever'), null);
+  assert.equal(C.budgetUntil('2026-11', 'months', 12), '2027-10');
+  assert.equal(C.budgetUntil('2026-11', 'until', 0, '2027-06'), '2027-06');
+  assert.equal(C.budgetUntil('2026-11', 'until', 0, '2026-05'), null);
+  assert.deepEqual(C.budgetDuration({ fromMonth: '2026-11', untilMonth: '2026-11' }), { kind: 'once' });
+  assert.deepEqual(C.budgetDuration({ fromMonth: '2026-11', untilMonth: '2027-04' }), { kind: 'months', n: 6 });
+  assert.deepEqual(C.budgetDuration({ fromMonth: '2026-11', untilMonth: '2027-02' }), { kind: 'until', until: '2027-02' });
+  assert.deepEqual(C.budgetDuration({ fromMonth: '2026-11' }), { kind: 'forever' });
+  assert.deepEqual(C.unsafeStateFields({ budgets: [{ id: 'b1', fromMonth: '2026-11', untilMonth: '<img>' }] }), ['copia.budgets[0].untilMonth']);
+});
+
 test('CSV: protección contra inyección y lectura con punto y coma', () => {
   assert.equal(C.csvSafe('=HYPERLINK("x")'), '"\'=HYPERLINK(""x"")"');
   assert.equal(C.csvSafe('@SUM'), "'@SUM");

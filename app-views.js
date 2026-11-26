@@ -42,7 +42,7 @@ function budgetConsumed(b, key) {
 }
 function budgetsFor(key) {
   const ctx = budgetCtx(key);
-  return S.budgets.filter(b => !b.archived).map(b => ({ b, r: C.budgetStatus(b, budgetConsumed(b, key), ctx, S.settings.warnPct), prev: budgetConsumed(b, C.addMonthsKey(key, -1)) }));
+  return S.budgets.filter(b => C.budgetActive(b, key)).map(b => ({ b, r: C.budgetStatus(b, budgetConsumed(b, key), ctx, S.settings.warnPct), prev: budgetConsumed(b, C.addMonthsKey(key, -1)) }));
 }
 function allReceivables() { return S.transactions.flatMap(t => C.receivableParts(t)); }
 function expectedStatus(x) { return x.status === 'expected' && x.due < today() ? 'late' : x.status; }
@@ -196,10 +196,10 @@ function expectedRow(x) {
 }
 function budgetHTML({ b, r, prev }, compact) {
   const name = esc(b.name);
-  return `<div class="budget"><div class="top"><button class="link-btn" style="color:var(--ink);padding:0;min-height:0;font-weight:700" data-act="budgetForm" data-id="${b.id}">${name}</button><span class="pill ${BUDGET_PILL[r.state]}">${BUDGET_LABEL[r.state]}</span></div>
+  return `<div class="budget"><div class="top"><button class="link-btn bud-name" data-act="budgetForm" data-id="${b.id}" aria-label="Editar ${name}">${name}${ic('edit', 'sm')}</button><span class="pill ${BUDGET_PILL[r.state]}">${BUDGET_LABEL[r.state]}</span></div>
     ${progress(r.pct, r.state === 'ok' ? '' : r.state)}
     <div class="meta"><span>${money(r.consumed)} de ${money(r.amount)} · ${Math.round(r.pct)} %</span><span>${r.available >= 0 ? 'Disponible ' + money(r.available) : '<span class="neg">Excedido ' + money(r.exceeded) + '</span>'}</span></div>
-    ${!compact ? `<div class="meta">${r.dailyPace !== undefined ? `<span>Ritmo sugerido: ${money(r.dailyPace)}/día</span><span>Proyección: ${money(r.projection)}</span>` : ''}<span>Mes anterior: ${money(prev)}</span></div>` : ''}</div>`;
+    ${!compact ? `<div class="meta">${r.dailyPace !== undefined ? `<span>Ritmo sugerido: ${money(r.dailyPace)}/día</span><span>Proyección: ${money(r.projection)}</span>` : ''}<span>Mes anterior: ${money(prev)}</span></div><div class="meta"><span>${esc(budgetRangeText(b))}${b.untilMonth && b.untilMonth > ui.month ? ' · quedan ' + C.monthDiff(ui.month, b.untilMonth) + (C.monthDiff(ui.month, b.untilMonth) === 1 ? ' mes más' : ' meses más') : b.untilMonth === ui.month && b.fromMonth !== b.untilMonth ? ' · último mes' : ''}</span></div>` : ''}</div>`;
 }
 function wishRow(x, p, compact) {
   const w = x.w, st = wishStatusText(x, p), ct = condText(w);
@@ -292,7 +292,7 @@ function vAjustes() {
   return `
     ${sectionH('Perfil')}<div class="list">${settingsRow('users', 'Perfiles', esc(PROFILE.name) + ' · ' + esc(PROFILE.currency) + ' · ' + PROFILES.list.length + ' perfiles', 'profiles')}</div>
     ${sectionH('Planificación')}<div class="list">
-      ${settingsRow('pie', 'Presupuestos', S.budgets.length + ' activos', 'go', 'presupuestos')}
+      ${settingsRow('pie', 'Presupuestos', S.budgets.filter(b => C.budgetActive(b, thisMonth())).length + ' activos', 'go', 'presupuestos')}
       ${settingsRow('hand', 'Préstamos', S.loans.length + ' registrados', 'go', 'prestamos')}
       ${settingsRow('target', 'Quiero comprar', S.wishes.filter(w => w.status === 'active').length + ' deseos', 'go', 'metas')}
       ${settingsRow('repeat', 'Ingresos y pagos recurrentes', S.rules.filter(r => r.active).length + ' reglas', 'go', 'recurrentes')}
@@ -342,7 +342,15 @@ function vPresupuestos() {
   const key = ui.month, list = budgetsFor(key);
   return `${monthSwitcher(key, 'month')}<div class="card">${list.length ? list.map(x => budgetHTML(x, false)).join('') : emptyState('pie', 'Sin presupuestos', 'Define límites globales, por categoría, naturaleza, etiqueta o cuenta. Pueden ser un valor fijo o un % de tus ingresos.', '')}</div>
     <button class="btn primary block" data-act="budgetForm">${ic('plus', 'sm')} Nuevo presupuesto</button>
-    <p class="hint">El consumo usa tu gasto personal: en gastos compartidos solo cuenta tu parte (y las partes que marcaste como regalo).</p>`;
+    ${budgetOthers(key)}
+    <p class="hint">Toca el nombre de un presupuesto para editarlo o cambiar hasta cuándo aplica. El consumo usa tu gasto personal: en gastos compartidos solo cuenta tu parte (y las partes que marcaste como regalo).</p>`;
+}
+// Presupuestos que no aplican al mes visto (terminados o que empiezan después): se pueden abrir para editarlos o eliminarlos.
+function budgetOthers(key) {
+  const rest = S.budgets.filter(b => !b.archived && !C.budgetActive(b, key));
+  if (!rest.length) return '';
+  return `${sectionH('Otros presupuestos')}<div class="card">${rest.map(b => `<button class="row-item" style="padding-left:0;padding-right:0" data-act="budgetForm" data-id="${b.id}"><span class="ico">${ic('pie')}</span>
+    <span class="grow"><span class="t">${esc(b.name)}</span><span class="s">${esc(budgetRangeText(b))} · ${b.untilMonth && b.untilMonth < key ? 'terminó' : 'aún no empieza'}</span></span><span class="r">${b.method === 'fixed' ? money(b.value) : esc(b.value) + ' %'}</span></button>`).join('')}</div>`;
 }
 function vMetas() {
   const p = C.wishPlan(S.wishFund, S.wishes, today()), hz = C.monthLabel(p.horizonKey).toLowerCase();

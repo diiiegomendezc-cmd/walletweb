@@ -792,7 +792,9 @@ function collectForm(txId, pid) {
 /* ================= Presupuestos ================= */
 function budgetForm(id) {
   const b = id ? S.budgets.find(x => x.id === id) : null;
-  const f = b ? { ...b, valueText: String(b.value) } : { name: '', scope: 'global', ref: '', method: 'fixed', valueText: '' };
+  const f = b ? { ...b, valueText: String(b.value) } : { name: '', scope: 'global', ref: '', method: 'fixed', valueText: '', fromMonth: ui.month || thisMonth() };
+  const d = b ? C.budgetDuration(b) : { kind: 'forever' };
+  f.dur = d.kind === 'months' ? 'm' + d.n : d.kind; f.untilText = d.until || ''; f.fromMonth = f.fromMonth || '';
   window.BF = f;
   openSheet({ id: 'bud', title: b ? 'Editar presupuesto' : 'Nuevo presupuesto', body: budgetBody(), footer: `<button class="btn primary" data-act="budgetSave">Guardar</button>${b ? `<button class="btn danger" data-act="budgetDelete" data-id="${b.id}" aria-label="Eliminar">${ic('trash', 'sm')}</button>` : ''}` });
 }
@@ -803,7 +805,28 @@ function budgetBody() {
     ${refSel ? `<div class="field"><label for="br">¿Cuál?</label><select id="br" class="input" data-bf="ref">${optionList(refSel, f.ref, 'Elegir…')}</select></div>` : f.scope === 'tag' ? `<div class="field"><label for="br">Etiqueta</label><input id="br" class="input" data-bf="ref" value="${esc(f.ref)}" autocomplete="off"></div>` : ''}
     <div class="field"><label for="bn">Nombre</label><input id="bn" class="input" data-bf="name" value="${esc(f.name)}" placeholder="Se completa solo si lo dejas vacío" autocomplete="off"></div>
     <div class="field"><label for="bm2">Método</label><select id="bm2" class="input" data-bf="method" data-rerender>${optionList([['fixed', 'Valor fijo mensual'], ['pctExpected', '% de ingresos esperados'], ['pctReceived', '% de ingresos recibidos']], f.method)}</select></div>
-    <div class="field"><label for="bv">${f.method === 'fixed' ? 'Valor' : 'Porcentaje (%)'}</label><input id="bv" class="input" inputmode="decimal" data-bf="valueText" value="${esc(f.valueText)}" placeholder="${f.method === 'fixed' ? '$ 0' : '30'}"></div><div id="budErr" class="err" role="alert"></div>`;
+    <div class="field"><label for="bv">${f.method === 'fixed' ? 'Valor' : 'Porcentaje (%)'}</label><input id="bv" class="input" inputmode="decimal" data-bf="valueText" value="${esc(f.valueText)}" placeholder="${f.method === 'fixed' ? '$ 0' : '30'}"></div>
+    <div class="field"><label for="bd">¿Por cuánto tiempo?</label><select id="bd" class="input" data-bf="dur" data-rerender>${optionList(BUDGET_DUR, f.dur)}</select></div>
+    <div class="grid2"><div class="field"><label for="bfm">Desde</label><input id="bfm" type="month" class="input" data-bf="fromMonth" data-rerender value="${esc(f.fromMonth)}"></div>
+      ${f.dur === 'until' ? `<div class="field"><label for="bum">Hasta</label><input id="bum" type="month" class="input" data-bf="untilText" data-rerender value="${esc(f.untilText)}" min="${esc(f.fromMonth)}"></div>` : ''}</div>
+    <p class="hint">${esc(budgetRangeText(budgetFormRange(f)))}${f.id ? '. Si cambias el valor, se corrige en todos los meses del presupuesto.' : ''}</p>
+    <div id="budErr" class="err" role="alert"></div>`;
+}
+const BUDGET_DUR = [['once', 'Solo un mes'], ['m3', '3 meses'], ['m6', '6 meses'], ['m12', 'Un año (12 meses)'], ['until', 'Hasta un mes que elijas'], ['forever', 'Indefinido (todos los meses)']];
+const RX_MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
+// Del formulario a { fromMonth, untilMonth }. Sin "Desde" (presupuestos anteriores) aplica desde siempre.
+function budgetFormRange(f) {
+  const kind = f.dur.startsWith('m') ? 'months' : f.dur, from = RX_MONTH.test(f.fromMonth) ? f.fromMonth : null;
+  const start = from || (kind === 'forever' || kind === 'until' ? null : ui.month || thisMonth());
+  const until = RX_MONTH.test(f.untilText) ? f.untilText : null;
+  return { fromMonth: start, untilMonth: start ? C.budgetUntil(start, kind, Number(f.dur.slice(1)), until) : (kind === 'until' ? until : null) };
+}
+function budgetRangeText(r) {
+  const L = k => C.monthLabel(k).toLowerCase();
+  if (!r.untilMonth) return r.fromMonth ? 'Todos los meses desde ' + L(r.fromMonth) : 'Todos los meses';
+  if (r.fromMonth === r.untilMonth) return 'Solo ' + L(r.fromMonth);
+  const n = r.fromMonth ? C.monthDiff(r.fromMonth, r.untilMonth) + 1 : 0;
+  return (r.fromMonth ? 'De ' + L(r.fromMonth) + ' a ' : 'Hasta ') + L(r.untilMonth) + (n ? ' (' + n + ' meses)' : '');
 }
 
 /* ================= Metas ================= */

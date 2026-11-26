@@ -302,6 +302,30 @@
     if (b.method === 'pctReceived') return mulDivRound(ctx.receivedIncome, b.value, 100);
     return b.value;
   }
+  // Vigencia de un presupuesto: desde fromMonth hasta untilMonth (ambos 'AAAA-MM', incluidos). Sin
+  // fromMonth aplica desde siempre (presupuestos anteriores a v1.37); sin untilMonth es indefinido.
+  function budgetActive(b, key) {
+    if (!b || b.archived) return false;
+    if (b.fromMonth && key < b.fromMonth) return false;
+    if (b.untilMonth && key > b.untilMonth) return false;
+    return true;
+  }
+  // Duración elegida en el formulario → mes final. kind: 'once' | 'forever' | 'months' (n) | 'until' (mes).
+  function budgetUntil(fromMonth, kind, n, until) {
+    if (kind === 'once') return fromMonth;
+    if (kind === 'months') return addMonthsKey(fromMonth, Math.max(1, Math.round(n || 1)) - 1);
+    if (kind === 'until') return until && until >= fromMonth ? until : null;
+    return null;
+  }
+  // Lo contrario, para abrir el formulario de edición con la opción que corresponde.
+  function budgetDuration(b) {
+    if (!b.untilMonth) return { kind: 'forever' };
+    if (!b.fromMonth) return { kind: 'until', until: b.untilMonth };
+    const n = monthDiff(b.fromMonth, b.untilMonth) + 1;
+    if (n === 1) return { kind: 'once' };
+    if ([3, 6, 12].includes(n)) return { kind: 'months', n };
+    return { kind: 'until', until: b.untilMonth };
+  }
   function budgetStatus(b, consumed, ctx, warnPct) {
     const amount = budgetBase(b, ctx);
     const available = amount - consumed;
@@ -1210,7 +1234,7 @@ function papelera(p) {
      app. Una copia manipulada podría traer otra cosa: antes de restaurarla se revisa que tengan el formato esperado.
      Devuelve la lista de campos con formato raro (vacía si todo está bien). */
   const RX_ID = /^[\w.:@-]{1,200}$/, RX_DATE = /^\d{4}-\d{2}(-\d{2})?$/, RX_COLOR = /^#[0-9a-fA-F]{3,8}$/, RX_NUM = /^-?\d+(\.\d+)?$/;
-  const STATE_DATE_KEYS = new Set(['date', 'due', 'nominal', 'firstDue', 'startDate', 'firstMonth', 'start', 'from', 'to', 'end', 'horizon']);
+  const STATE_DATE_KEYS = new Set(['date', 'due', 'nominal', 'firstDue', 'startDate', 'firstMonth', 'start', 'from', 'to', 'end', 'horizon', 'fromMonth', 'untilMonth']);
   const STATE_NUM_KEYS = new Set(['cuotas', 'transparency', 'blur', 'refract']);
   function unsafeStateFields(st) {
     const bad = [];
@@ -1245,7 +1269,7 @@ function papelera(p) {
     easter, holidaysCO, holidayName, isBusinessDay, prevBusinessDay, nextBusinessDay, occurrences,
     attributeToPeople, txEffects, isActive, accountBalance, personalAmount, receivableParts, expenseInMonth, incomeInMonth, installmentStatus,
     loanTotalInterest, loanSchedule, loanSummary, allocatePayment,
-    budgetBase, budgetStatus, txMatchesScope, goalSummary, wishPlan, wishMonthly,
+    budgetBase, budgetStatus, budgetActive, budgetUntil, budgetDuration, txMatchesScope, goalSummary, wishPlan, wishMonthly,
     duplicateScore, parsePastedText, parseReceiptText, receiptLinesFromWords, mergeReceiptReads, parseAmountToken, matchMerchant, editDistance, csvSafe, toCSV, parseCSV, parseDateFlexible,
     encryptBackup, decryptBackup, hashPin, b64, unb64,
     driveSafe, driveTarget, driveScript, DRIVE_SCRIPT_VERSION, DRIVE_MONTHS, unsafeStateFields, merchantScore, knownName

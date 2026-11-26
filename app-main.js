@@ -155,7 +155,11 @@ const ACT = {
     if (!value || value <= 0 || (f.method !== 'fixed' && value > 100)) return err(f.method === 'fixed' ? 'Escribe un valor válido.' : 'Escribe un porcentaje entre 1 y 100.');
     const subRef = S.categories.flatMap(c => c.subs).find(s => s.id === f.ref);
     const refName = { global: 'Global', category: catById(f.ref)?.name, subcategory: subRef?.name, nature: NATURES[f.ref], tag: '#' + f.ref, account: accById(f.ref)?.name }[f.scope];
-    const b = { id: f.id || uid(), name: f.name.trim() || refName, scope: f.scope, ref: f.scope === 'global' ? null : f.ref, method: f.method, value, period: 'month', archived: false, rulesVersion: 1 };
+    if (f.dur === 'until' && !RX_MONTH.test(f.untilText)) return err('Elige hasta qué mes.');
+    const range = budgetFormRange(f);
+    if (range.fromMonth && range.untilMonth && range.untilMonth < range.fromMonth) return err('El mes final debe ser igual o posterior al inicial.');
+    const old = f.id ? S.budgets.find(x => x.id === f.id) : null;
+    const b = { ...(old || {}), id: f.id || uid(), name: f.name.trim() || refName, scope: f.scope, ref: f.scope === 'global' ? null : f.ref, method: f.method, value, period: 'month', archived: false, rulesVersion: 1, fromMonth: range.fromMonth, untilMonth: range.untilMonth };
     const i = S.budgets.findIndex(x => x.id === b.id); if (i >= 0) S.budgets[i] = b; else S.budgets.push(b);
     save(); await closeSheet(true); render(); toast('Presupuesto guardado');
   },
@@ -793,6 +797,7 @@ function migrate(st) {
   assignPalettes(out.categories); if (out.schema < 6) out.schema = 6; // v1.23: familia de color por categoría
   if (!out.driveFiles || typeof out.driveFiles !== 'object' || Array.isArray(out.driveFiles)) out.driveFiles = {};
   if (out.schema < 7) out.schema = 7; // v1.33: facturas en Google Drive (S.settings.drive y S.driveFiles)
+  if (out.schema < 8) out.schema = 8; // v1.37: vigencia de presupuestos (fromMonth/untilMonth; sin ellos aplica siempre, como antes)
   return out;
 }
 async function purgeTrash() {

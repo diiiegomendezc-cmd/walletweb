@@ -1,7 +1,7 @@
 /* WalletWeb — base: estado, almacenamiento local, utilidades de interfaz, bloqueo. */
 'use strict';
 const C = window.WWCore;
-const APP_VERSION = '1.36.0';
+const APP_VERSION = '1.37.0';
 const IN_FRAME = (() => { try { return window.self !== window.top; } catch (e) { return true; } })();
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));
@@ -106,7 +106,7 @@ function defaultWishFund() {
 }
 function defaultState() {
   return {
-    schema: 7, createdAt: new Date().toISOString(), demo: false,
+    schema: 8, createdAt: new Date().toISOString(), demo: false,
     settings: { theme: 'auto', lockMinutes: 1, lockOnHide: true, privacy: false, budgetMode: 'installment', warnPct: 80, pin: null, passkey: null,
       pinFails: 0, lockUntil: 0, holidayEx: { extraHolidays: [], workdays: [] }, lastBackupAt: null, onboarded: false, notifDetail: 'private',
       glass: { transparency: 65, blur: 3, wallpaper: 'waves', refract: 70 }, scanAuto: true, scanMode: 'clean', tabs: DEFAULT_TABS.slice(), homeCharts: {}, drive: null, driveAuto: true },
