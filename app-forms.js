@@ -51,7 +51,7 @@ function txFormBody() {
   const withCat = d.type === 'expense' || d.type === 'income';
   const accBlock = `<div class="grid2 acc-ref"><div class="field"><label for="accSel">Cuenta</label><select id="accSel" class="input" data-f="accountId" data-rerender>${accOpts(d.accountId, null)}</select></div>${refField}</div><p class="hint" id="refHint" style="margin:-8px 4px 12px"></p>`;
   return `
-    ${seg('Tipo de movimiento', [['expense', 'Gasto'], ['income', 'Ingreso'], ['transfer', 'Transferencia']], ['expense', 'income', 'transfer'].includes(d.type) ? d.type : '', 'dtype')}
+    ${LINKED_TX.has(d.type) && d.id ? '' : seg('Tipo de movimiento', [['expense', 'Gasto'], ['income', 'Ingreso'], ['transfer', 'Transferencia']], ['expense', 'income', 'transfer'].includes(d.type) ? d.type : '', 'dtype')}
     ${!['expense', 'income', 'transfer'].includes(d.type) ? `<p class="hint">Tipo: <b>${esc(TYPES[d.type])}</b> (creado desde ${esc(SOURCES[d.source] || d.source)}).</p>` : ''}
     <div class="amount-wrap">
       <label for="amt" class="sr-only">Importe</label>
@@ -87,7 +87,7 @@ function txFormBody() {
       <div class="sub-h">Otros datos</div>
       ${d.type !== 'expense' || d.productUrl ? `<div class="field"><label for="purl">${d.type === 'expense' ? 'Otro enlace' : 'Enlace del producto o sitio'}</label><input id="purl" class="input" data-f="productUrl" value="${esc(d.productUrl)}" inputmode="url" placeholder="https://…" autocomplete="off"></div>` : ''}
       ${d.type === 'expense' && acc?.type !== 'credit' ? instField() : ''}
-      <div class="field"><span class="lbl">Estado</span>${seg('Estado', [['confirmed', 'Confirmado'], ['pending', 'Por revisar'], ['draft', 'Borrador']], d.status, 'dstatus')}</div>
+      ${LINKED_TX.has(d.type) && d.id ? '' : `<div class="field"><span class="lbl">Estado</span>${seg('Estado', [['confirmed', 'Confirmado'], ['pending', 'Por revisar'], ['draft', 'Borrador']], d.status, 'dstatus')}</div>`}
     <div id="txErr" class="err" role="alert"></div>`;
 }
 function isLendDraft() { return !!(D && D.type === 'expense' && !D.id && catById(D.categoryId)?.defaultNature === 'loan'); }
@@ -189,10 +189,15 @@ async function viewReceipt(id) {
 // Resultado del escáner → JPEG limpio, miniatura y PDF; luego se lee el texto
 async function useScan(res) {
   if (!D) return;
-  const cv = res.canvas;
-  const jpeg = await canvasToBlob(cv, 'image/jpeg', 0.82);
-  const thumb = await canvasToBlob(scaleCanvas(cv, 420), 'image/jpeg', 0.72);
-  const pdf = await buildReceiptPdf(jpeg, cv.width, cv.height, []);
+  const cv = res.canvas, me = D;
+  me._scanBusy = true; // mientras se arma el PDF, Guardar espera (si no, la factura nueva se perdería)
+  let jpeg, thumb, pdf;
+  try {
+    jpeg = await canvasToBlob(cv, 'image/jpeg', 0.82);
+    thumb = await canvasToBlob(scaleCanvas(cv, 420), 'image/jpeg', 0.72);
+    pdf = await buildReceiptPdf(jpeg, cv.width, cv.height, []);
+  } finally { me._scanBusy = false; }
+  if (D !== me) return;
   if (D._thumbUrl) URL.revokeObjectURL(D._thumbUrl);
   D._thumbBlob = thumb; D._thumbUrl = URL.createObjectURL(thumb); D._scanJpeg = jpeg; D._scanSize = [cv.width, cv.height]; D._pdfWords = null;
   D._scan = { src: res.src, quad: res.quad, curve: res.curve, userCurve: res.userCurve, manual: res.manual };
@@ -217,6 +222,11 @@ function ocrStatusHTML() {
   if (r.total && amt && amt !== r.total) sug.push(`<button type="button" class="chip" data-act="ocrUse" data-k="amount">Usar total ${esc(f(r.total))}</button>`);
   if (r.date && r.date !== D.date) sug.push(`<button type="button" class="chip" data-act="ocrUse" data-k="date">Fecha ${esc(fdShort(r.date))}</button>`);
   if (r.items.length && D.items.some(it => String(it.name).trim()) && !D.ocrFilled?.items) sug.push(`<button type="button" class="chip" data-act="ocrUse" data-k="items">Agregar ${r.items.length} ítem(s) de la foto</button>`);
+  const mer = r.merchant && D.type === 'expense' ? ocrMerchant(r.merchant) : '';
+  if (mer && String(D.merchant || '').trim() && mer !== D.merchant.trim()) sug.push(`<button type="button" class="chip" data-act="ocrUse" data-k="merchant">Tienda ${esc(mer)}</button>`);
+  if (r.tax && String(D.tax || '').trim() && C.evalAmount(D.tax) !== r.tax) sug.push(`<button type="button" class="chip" data-act="ocrUse" data-k="tax">Impuestos ${esc(f(r.tax))}</button>`);
+  // al cambiar la foto de un movimiento ya guardado: reemplazar todo de una vez con lo leído
+  if (sug.length > 1) sug.unshift(`<button type="button" class="chip" data-act="ocrUse" data-k="all" aria-pressed="true">Usar todo lo de la foto</button>`);
   return `<div class="small" style="font-weight:650">${o.source === 'texto' ? 'Leído del texto' : 'Leído de la foto'}</div><div class="small muted" style="margin-top:2px">${esc(bits.join(' · '))}</div>
     ${sug.length ? `<div class="chips wrap" style="margin-top:8px">${sug.join('')}</div>` : ''}<div class="tiny muted" style="margin-top:6px">Los campos marcados “de la foto” se pueden corregir.</div>`;
 }
@@ -451,6 +461,7 @@ function gmapsSearchUrl(name, extra) { const q = [name, extra].map(x => String(x
 function validUrl(u) { if (!u) return true; try { const x = new URL(u); return x.protocol === 'https:' || x.protocol === 'http:'; } catch (e) { return false; } }
 async function txSave() {
   const d = D, err = m => { $('#txErr').textContent = m; return false; };
+  if (d._scanBusy) { for (let i = 0; i < 100 && d._scanBusy; i++) await new Promise(r => setTimeout(r, 100)); if (D !== d) return; }
   const amount = C.evalAmount(d.amountText);
   // Único campo obligatorio: el monto, de 1 peso en adelante (los ajustes pueden ser negativos).
   if (amount === null || (d.type !== 'adjust' && amount < 1) || amount === 0) { $('#amt')?.focus(); return err('Escribe un monto de $ 1 o más.'); }
@@ -502,6 +513,12 @@ async function txSave() {
     tx.split = split;
   } else tx.split = null;
   tx.installments = d.type === 'expense' && Number(d.instN) > 1 ? { n: Number(d.instN), firstMonth: d.firstMonth, interestBp: 0 } : null;
+  if (prevTx && LINKED_TX.has(prevTx.type)) {
+    Object.assign(tx, { type: prevTx.type, status: prevTx.status, categoryId: prevTx.categoryId || null, subcategoryId: prevTx.subcategoryId || null, nature: null, items: [], split: null, installments: null });
+    const le = linkedEdit(prevTx, tx);
+    if (le.error) return err(le.error);
+    le.apply();
+  }
   if (d.removeReceipt && !d.receiptBlob && tx.receipt) { await Store.del('rcpt:' + tx.id); await Store.del('rcptthumb:' + tx.id); tx.receipt = null; }
   if (d.receiptBlob) {
     if (d.receiptMeta?.scanned) { // AAAAMMDD_Tienda_Importe.pdf
@@ -632,7 +649,7 @@ function txDetail(id) {
     ${inst ? `<div class="card"><b>Compra a cuotas</b><dl class="kv" style="margin-top:8px"><dt>Cuotas</dt><dd>${inst.n} de ${money(inst.value)}</dd><dt>Cuotas causadas</dt><dd>${inst.paidCount}</dd><dt>Pendientes</dt><dd>${inst.pendingCount} · ${money(inst.pendingAmount)}</dd><dt>Primera cuota</dt><dd>${esc(C.monthLabel(t.installments.firstMonth))}</dd></dl></div>` : ''}
     ${t.receipt ? `<div class="card"><b>Comprobante</b> ${typeof driveReceiptPill === 'function' ? driveReceiptPill(t) : '<span class="pill">En este dispositivo</span>'}<div id="rcptView" style="margin-top:10px" class="muted small">Cargando…</div>${typeof driveReceiptLink === 'function' ? driveReceiptLink(t) : ''}</div>` : ''}`,
     footer: `${t.status !== 'confirmed' ? `<button class="btn primary" data-act="txConfirm" data-id="${t.id}">${ic('check', 'sm')} Confirmar</button>` : ''}
-      ${['expense', 'income', 'transfer', 'adjust'].includes(t.type) ? `<button class="btn" data-act="txEdit" data-id="${t.id}">${ic('edit', 'sm')} Editar</button><button class="btn" data-act="txDup" data-id="${t.id}" aria-label="Duplicar">${ic('copy', 'sm')}</button>` : SIMPLE_EDIT.has(t.type) ? `<button class="btn" data-act="txEditSimple" data-id="${t.id}">${ic('edit', 'sm')} Editar</button>` : ''}
+      ${['expense', 'income', 'transfer', 'adjust'].includes(t.type) ? `<button class="btn" data-act="txEdit" data-id="${t.id}">${ic('edit', 'sm')} Editar</button><button class="btn" data-act="txDup" data-id="${t.id}" aria-label="Duplicar">${ic('copy', 'sm')}</button>` : LINKED_TX.has(t.type) ? `<button class="btn" data-act="txEdit" data-id="${t.id}">${ic('edit', 'sm')} Editar</button>` : ''}
       <button class="btn danger" data-act="txDelete" data-id="${t.id}" aria-label="Eliminar">${ic('trash', 'sm')}</button>` });
   if (t.receipt) Promise.all([Store.get('rcpt:' + t.id), Store.get('rcptthumb:' + t.id)]).then(([b, th]) => {
     const el = $('#rcptView'); if (!el) return;
@@ -641,57 +658,30 @@ function txDetail(id) {
     el.innerHTML = `${pic ? `<button type="button" class="thumb-open" data-act="rcptView" data-id="${t.id}" aria-label="Ver cómo quedó la factura"><img class="thumb" src="${pic}" alt="Factura"></button><div class="small muted vw-tip">Toca la factura para verla completa</div>` : ''}${b.type === 'application/pdf' ? `<button type="button" class="btn block" style="margin-top:10px" data-act="rcptView" data-id="${t.id}">${ic('doc', 'sm')} Ver factura (${Math.round(b.size / 1024)} KB)</button>` : ''}`;
   });
 }
-/* Edición de movimientos que nacen de un préstamo o de un cobro: valor, fecha, cuenta y nota, manteniendo el préstamo
-   (abonos repartidos de nuevo en interés y capital) o el gasto compartido (lo cobrado) en orden. */
-const SIMPLE_EDIT = new Set(['collect', 'repay_in', 'repay_out', 'loan_out', 'loan_in']);
-function txEditSimple(id) {
-  const t = txById(id); if (!t || !SIMPLE_EDIT.has(t.type)) return;
-  const loan = t.loanId ? loanById(t.loanId) : null;
-  const hint = t.type === 'collect' ? 'Cambia lo que quedó cobrado de ese gasto compartido.'
-    : t.type === 'repay_in' || t.type === 'repay_out' ? 'El préstamo se actualiza solo: se reparte de nuevo cuánto va a interés y cuánto a capital.'
-    : 'Cambia también el préstamo' + (loan ? ' con ' + personName(loan.personId) : '') + ': el valor prestado, la fecha y la cuenta.';
-  const accs = activeAccounts().map(a => [a.id, a.name]); if (t.accountId && !accs.some(a => a[0] === t.accountId) && accById(t.accountId)) accs.push([t.accountId, accById(t.accountId).name]);
-  openSheet({ id: 'txs', title: 'Editar ' + TYPES[t.type].toLowerCase(), body: `<p class="hint" style="margin:0 0 14px">${esc(hint)}</p>
-    <div class="field"><label for="tsA">Valor</label><input id="tsA" class="input" inputmode="decimal" value="${t.amount}" autocomplete="off"></div>
-    <div class="field"><label for="tsAcc">Cuenta</label><select id="tsAcc" class="input">${optionList(accs, t.accountId, 'Elegir cuenta…')}</select></div>
-    <div class="field"><label for="tsD">Fecha</label><input id="tsD" type="date" class="input" value="${esc(t.date)}"></div>
-    <div class="field"><label for="tsN">Nota</label><input id="tsN" class="input" value="${esc(t.note || '')}" autocomplete="off"></div>
-    <div id="tsErr" class="err" role="alert"></div>`,
-    footer: `<button class="btn primary" data-act="txEditSimpleSave" data-id="${t.id}">${ic('check', 'sm')} Guardar cambios</button>` });
-}
-async function txEditSimpleSave(id) {
-  const t = txById(id); if (!t) return;
-  const err = m => { $('#tsErr').textContent = m; };
-  const v = C.evalAmount($('#tsA').value), acc = $('#tsAcc').value, date = $('#tsD').value, note = $('#tsN').value.trim();
-  if (!v || v <= 0) return err('Escribe un valor válido.');
-  if (!accById(acc)) return err('Elige la cuenta.');
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return err('Elige la fecha.');
-  const before = { amount: t.amount, date: t.date, accountId: t.accountId };
-  if (t.type === 'collect') {
-    const src = t.refTxId ? txById(t.refTxId) : null, part = src?.split?.parts.find(p => p.personId === t.personId);
-    if (part) {
-      const max = part.amount - Math.max(0, (part.collected || 0) - t.amount);
-      if (v > max) return err('Supera lo que te debía de ese gasto (' + C.formatMoney(max) + ').');
-      part.collected = Math.max(0, (part.collected || 0) - t.amount) + v;
-    }
-  } else {
-    const l = loanById(t.loanId);
-    if (l) {
-      const isLoan = t.type === 'loan_out' || t.type === 'loan_in';
-      const draft = Object.assign({}, l, isLoan ? { principal: v } : {}, { payments: (l.payments || []).map(p => p.txId === t.id ? Object.assign({}, p, { amount: v, date, accountId: acc, note }) : p) });
-      const re = C.reallocatePayments(draft);
-      if (re.error) return err(re.error);
-      if (isLoan) { l.principal = v; l.startDate = date; l.accountId = acc; }
-      l.payments = re.payments;
-      for (const p of l.payments) { const pt = p.txId && txById(p.txId); if (pt) { pt.interest = p.interest; pt.capital = p.capital; } }
-    }
+/* Movimientos que nacen de un préstamo o de un cobro: se editan con el formulario completo (valor, fecha, cuenta,
+   referencia, nota, soporte), con el tipo fijo. Al guardar se mantiene en orden el préstamo (todos los abonos se
+   reparten de nuevo en interés y capital) o el gasto compartido (lo cobrado). */
+const LINKED_TX = new Set(['collect', 'repay_in', 'repay_out', 'loan_out', 'loan_in']);
+// Revisa el cambio sin tocar nada: { error } o { apply } para aplicarlo al guardar
+function linkedEdit(prev, tx) {
+  const v = tx.amount;
+  if (prev.type === 'collect') {
+    const src = prev.refTxId ? txById(prev.refTxId) : null, part = src?.split?.parts.find(p => p.personId === prev.personId);
+    if (!part) return { apply() {} };
+    const base = Math.max(0, (part.collected || 0) - prev.amount), max = part.amount - base;
+    if (v > max) return { error: 'Supera lo que te debía de ese gasto (' + C.formatMoney(max) + ').' };
+    return { apply() { part.collected = base + v; } };
   }
-  Object.assign(t, { amount: v, date, accountId: acc, note, updatedAt: new Date().toISOString(), version: (t.version || 1) + 1 });
-  const ch = ['amount', 'date', 'accountId'].filter(k => before[k] !== t[k]);
-  audit('transaction.updated', 'transaction', t.id, `${TYPES[t.type]} editado${ch.length ? ': ' + ch.map(k => ({ amount: 'valor', date: 'fecha', accountId: 'cuenta' })[k]).join(', ') : ''}`);
-  save(); await closeSheet(true); await closeSheet(true);
-  if (sheets.length && sheets[sheets.length - 1].id === 'loanD' && t.loanId) { await closeSheet(true); render(); loanDetail(t.loanId); } else render(); // el préstamo abierto debajo se muestra actualizado
-  txDetail(t.id); toast('Cambios guardados');
+  const l = loanById(prev.loanId); if (!l) return { apply() {} };
+  const isLoan = prev.type === 'loan_out' || prev.type === 'loan_in';
+  const draft = Object.assign({}, l, isLoan ? { principal: v } : {}, { payments: (l.payments || []).map(p => p.txId === prev.id ? Object.assign({}, p, { amount: v, date: tx.date, accountId: tx.accountId, note: tx.note }) : p) });
+  const re = C.reallocatePayments(draft);
+  if (re.error) return { error: re.error };
+  return { apply() {
+    if (isLoan) { l.principal = v; l.startDate = tx.date; l.accountId = tx.accountId; }
+    l.payments = re.payments;
+    for (const p of l.payments) { const pt = p.txId === tx.id ? tx : p.txId && txById(p.txId); if (pt) { pt.interest = p.interest; pt.capital = p.capital; } }
+  } };
 }
 async function txDelete(id) {
   const t = txById(id); if (!t) return;

@@ -28,7 +28,6 @@ const ACT = {
   // Movimientos
   newTx: () => openTxForm(),
   txDetail: el => txDetail(el.dataset.id),
-  txEditSimple: el => txEditSimple(el.dataset.id), txEditSimpleSave: el => txEditSimpleSave(el.dataset.id),
   txEdit: async el => { const t = txById(el.dataset.id); await closeSheet(true); openTxForm(null, t); },
   txDup: async el => { const t = txById(el.dataset.id); await closeSheet(true); const d = draftFromTx(t); openTxForm(Object.assign(stripD(d), { id: null, date: today(), time: C.nowTime(), status: 'confirmed', source: 'manual' })); },
   txDelete: el => txDelete(el.dataset.id),
@@ -54,6 +53,16 @@ const ACT = {
     if (k === 'amount') { D.amountText = Number(r.total).toLocaleString('es-CO'); D.ocrFilled.amount = true; }
     if (k === 'date') D.date = r.date;
     if (k === 'items') { D.items = D.items.filter(it => String(it.name).trim() || String(it.unit).trim()).concat(receiptItems(r.items)); D.ocrFilled.items = true; }
+    if (k === 'merchant') { D.merchant = ocrMerchant(r.merchant); D.ocrFilled.merchant = true; }
+    if (k === 'tax') { D.tax = Number(r.tax).toLocaleString('es-CO'); D.ocrFilled.tax = true; if (!D.rows.includes('tax')) D.rows.push('tax'); }
+    if (k === 'all') { // lo leído reemplaza lo que había (ítems incluidos); lo que la foto no trae se conserva
+      D.ocrFilled = D.ocrFilled || {};
+      if (r.total) { D.amountText = Number(r.total).toLocaleString('es-CO'); D.ocrFilled.amount = true; }
+      if (r.date) D.date = r.date;
+      if (r.merchant && D.type === 'expense') { D.merchant = ocrMerchant(r.merchant); D.ocrFilled.merchant = true; }
+      if (r.items.length && D.type === 'expense') { D.items = receiptItems(r.items); D.ocrFilled.items = true; }
+      for (const x of ['tax', 'tip', 'discount', 'shipping']) if (r[x]) { D[x] = Number(r[x]).toLocaleString('es-CO'); D.ocrFilled[x] = true; if (!D.rows.includes(x)) D.rows.push(x); }
+    }
     rerenderTx(); },
   ptoggle: el => { const v = el.dataset.v, i = D.people.indexOf(v); if (i >= 0) D.people.splice(i, 1); else D.people.push(v); rerenderTx(); },
   pgroup: el => { const ids = S.people.filter(p => !p.archived && p.group === el.dataset.v).map(p => p.id); const all = ids.every(id => D.people.includes(id)); D.people = all ? D.people.filter(id => !ids.includes(id)) : [...new Set([...D.people, ...ids])]; rerenderTx(); },
