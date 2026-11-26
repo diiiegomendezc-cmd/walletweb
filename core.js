@@ -507,6 +507,14 @@
       if (SKIPPH.test(low) || (!ph && (fixed.match(/\d/g) || []).length > 2)) continue;
       if (/\bp\.h\.$/.test(low) || /\b(edificio|centro comercial|conjunto residencial|copropiedad|parqueaderos?)\b/.test(low) && nLetters(fixed) >= 10) {
         let name = fixed.replace(/[^A-Za-zÁÉÍÓÚÑáéíóúñ0-9.&)]+$/, '').trim();
+        // nombre en el renglón siguiente ("EDIFICIO CENTRO COMERCIAL" / "LAS PALMAS P.H.")
+        if (!/\bp\.h\.$/.test(low) && k + 1 < top.length) {
+          const nx = fixBizWords(top[k + 1].replace(/^[^A-Za-zÁÉÍÓÚÑáéíóúñ]+/, '')).replace(/(\bP\.H\.).*$/, '$1').trim();
+          if (/\bp\.h\.$/.test(plain(nx)) && nx.split(/\s+/).length <= 5 && !SKIPPH.test(plain(nx))) name += ' ' + nx;
+        }
+        // basura antes de "CENTRO COMERCIAL": si parece "EDIFICIO" se escribe bien; si no, se quita
+        { const ci = plain(name).indexOf('centro comercial');
+          if (ci > 0) { const pre = plain(name.slice(0, ci)).toUpperCase().replace(/[^A-Z]/g, ''); name = (/IFIC|EDIF|DIFI/.test(pre) || editDistance(pre, 'EDIFICIO') <= 3 ? 'EDIFICIO ' : '') + name.slice(ci); } }
         // primera palabra partida en el renglón de arriba ("EDIF" / "...CENTRO COMERCIAL ...")
         const prev = k > 0 ? top[k - 1].trim() : '';
         if (/^[A-Za-zÁÉÍÓÚÑ]{3,8}$/.test(prev)) { const pv = plain(prev).toUpperCase(), full = BIZ_WORDS.find(w => plain(w).toUpperCase().startsWith(pv)); if (full && !plain(name).toUpperCase().startsWith(plain(full).toUpperCase())) name = full + ' ' + name.split(/\s+/).filter((wd, i) => i > 0 || BIZ_PLAIN.includes(plain(wd).toUpperCase())).join(' '); }
@@ -624,6 +632,10 @@
     const rest = total && okSub(subtotal) ? total - subtotal - (a.tip ?? b.tip ?? 0) - (a.shipping ?? b.shipping ?? 0) : 0;
     if (!tax && rateOk(rest, subtotal)) tax = rest;
     if (!tax) { const t0 = a.tax || b.tax; tax = t0 && (!total || t0 < total * 0.3) ? t0 : null; }
+    // con "IVA 19 %" impreso y ningún IVA que cuadre, el IVA sale del total (19 % incluido) y el subtotal es el resto
+    let sub2 = subtotal;
+    if (total && (a.iva19 || b.iva19) && !okTax(tax, okSub(subtotal) ? subtotal : null)) { tax = total - Math.round(total / 1.19); sub2 = total - tax; }
+    else if (!okSub(subtotal)) sub2 = null;
     const goals = [total, tax ? total - tax : null, subtotal].filter(Boolean);
     const fits = r => r.items.length && goals.some(g => Math.abs(sumIt(r) - g) <= 1);
     const near = r => { const its = r.items.filter(i => !total || i.amount <= total * 1.02); const sm = its.reduce((t, i) => t + i.amount, 0); return { its, d: Math.min(...goals.map(g => Math.abs(sm - g)), Infinity) }; };
@@ -642,7 +654,7 @@
       else if (wa.length && wa.every(x => wb.includes(x)) && nLetters(na2) >= 4 && !/\bp\.?h\b/.test(nb2)) merchant = a.merchant;
     }
     if (!merchant) merchant = merchantScore(b.merchant) > merchantScore(a.merchant) ? b.merchant : (a.merchant || b.merchant);
-    return Object.assign({}, a, { total, tax, subtotal, items, date, merchant, nit: a.nit || b.nit, tip: a.tip ?? b.tip, discount: a.discount ?? b.discount, shipping: a.shipping ?? b.shipping });
+    return Object.assign({}, a, { total, tax, subtotal: sub2, items, date, merchant, nit: a.nit || b.nit, tip: a.tip ?? b.tip, discount: a.discount ?? b.discount, shipping: a.shipping ?? b.shipping });
   }
   // Montos casi iguales leídos de varias formas (389.004, 389.314, 389.264, 389.064): se vota cifra por cifra.
   // Solo junta montos de 4+ cifras, del mismo largo, con a lo sumo 2 cifras distintas y menos de 1 % de diferencia.
@@ -816,7 +828,7 @@
       r.items.push({ name: name.slice(0, 60), qty, amount: v, alts, sep: a.sep || v < 1000 });
     }
     if (tipSum) r.tip = tipSum; if (discSum) r.discount = discSum; if (shipSum) r.shipping = shipSum;
-    const iva19 = lines.some(l => /\b19[.,]?0{0,2}\s?%/.test(l) && TAXW.test(plain(l))); // "IVA 19 %" impreso
+    const iva19 = lines.some(l => /\b19[.,x-]?0{0,2}\s?%/.test(l) && TAXW.test(plain(l))); // "IVA 19 %" impreso
     if (iva19) r.iva19 = true;
     // Total por votación entre fuentes independientes (un número mal leído o tapado por un dedo no decide solo)
     {

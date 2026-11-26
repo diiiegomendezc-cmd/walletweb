@@ -1639,16 +1639,318 @@ function scanProcess(src, quad, curve, userCurve, mode, det) {
   const pre = level; level = scanDewarp(level, 3); T.push(performance.now()); // endereza cada renglón (papel arrugado), hasta 3 pasadas
   let straight = level; for (let i = 0; i < 4; i++) { const nx = scanStraighten(straight); if (nx === straight) break; straight = nx; } T.push(performance.now()); // endereza renglones (hasta 4 pasadas, solo si mejora)
   const res = scanClean(straight, mode || 'clean'); T.push(performance.now()); res.canvas = scanTrim(res.canvas);
-  if (level !== pre) { res.flatSrc = pre; res.flatMode = mode || 'clean'; } // para una lectura de respaldo sin enderezar renglones
+  res.flatSrc = pre; res.flatMode = mode || 'clean'; // lectura de respaldo: sin enderezar renglones y con la otra limpieza
   if (typeof window !== 'undefined' && window.SCAN_DEBUG) window.__scanT = { deskew: Math.round(T[1] - T[0]), dewarp: Math.round(T[2] - T[1]), straighten: Math.round(T[3] - T[2]), clean: Math.round(T[4] - T[3]) };
   return res;
 }
 // Copia para el lector de texto: con letras pequeñas (menos de ~26 px de alto) lee mucho mejor si se amplía
 // La misma foto sin enderezar renglones: si la primera lectura queda incompleta, se lee también esta y se combinan
+// Limpieza de la versión publicada (v1.35, otra sesión): luz en dos escalas y umbral por zonas. Se usa en la lectura de
+// respaldo: lee mejor algunos tiquetes que la limpieza principal y viceversa.
+function sInkScale(ink, w, h) {
+  const runs = [];
+  for (let y = 0; y < h; y += 2) { let r = 0; for (let x = 0; x <= w; x++) { if (x < w && ink[y * w + x]) r++; else { if (r >= 1 && r <= 40) runs.push(r); r = 0; } } }
+  // moda (no mediana): las letras dan muchos trazos del mismo grosor; sombras y manchas dan largos dispersos
+  const cnt = new Float32Array(42); for (const r of runs) cnt[r]++;
+  let best = 0, sw = 2;
+  for (let r = 2; r <= 40; r++) { const v = cnt[r - 1] * 0.25 + cnt[r] + cnt[r + 1] * 0.5; if (v > best) { best = v; sw = r; } } // los trazos de 1 px son ruido o bordes
+  if (!runs.length) sw = 2;
+  sw = Math.max(1.2, Math.min(14, sw));
+  return { sw };
+}
+function sPrintedMask(ink, nv, w, h, sw, fGrown) {
+  const { lab, C } = sComponents(ink, w, h, nv);
+  const minH = Math.max(4, sw * 2.2);
+  // Grosor de cada pieza (distancia al borde): las letras son trazos finos; las sombras de los pliegues, manchas macizas
+  {
+    const dt = new Uint8Array(w * h);
+    for (let p = 0; p < w * h; p++) dt[p] = ink[p] ? 255 : 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const p = y * w + x; if (!dt[p]) continue;
+      const m = Math.min(x > 0 ? dt[p - 1] : 0, y > 0 ? dt[p - w] : 0, x > 0 && y > 0 ? dt[p - w - 1] : 0, x < w - 1 && y > 0 ? dt[p - w + 1] : 0); if (m + 1 < dt[p]) dt[p] = m + 1; }
+    for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) { const p = y * w + x; if (!dt[p]) continue;
+      const m = Math.min(x < w - 1 ? dt[p + 1] : 0, y < h - 1 ? dt[p + w] : 0, x < w - 1 && y < h - 1 ? dt[p + w + 1] : 0, x > 0 && y < h - 1 ? dt[p + w - 1] : 0); if (m + 1 < dt[p]) dt[p] = m + 1; }
+    const th = new Uint8Array(C.length + 1); for (let p = 0; p < w * h; p++) { const id = lab[p]; if (id && dt[p] > th[id]) th[id] = dt[p]; }
+    for (const c of C) c.thick = th[c.id];
+  }
+  // Alto típico de letra: solo cuentan las piezas que tienen al lado otra de alto parecido a la misma altura
+  // (los pedacitos de pliegues no forman filas; las letras sí)
+  const pre = C.filter(c => c.h >= minH && c.area >= sw * sw * 1.5 && c.w <= c.h * 9);
+  let L = 20, thickL = Math.max(1, Math.round(sw / 2 + 0.5));
+  {
+    const cs = 32, gw0 = Math.ceil(w / cs) + 1, g0 = new Map();
+    pre.forEach((c, i) => { const k = ((c.cy / cs) | 0) * gw0 + ((c.cx / cs) | 0); if (!g0.has(k)) g0.set(k, []); g0.get(k).push(i); });
+    const hs = [], ths = [];
+    pre.forEach(a => {
+      const R = Math.ceil(a.h * 2.5 / cs) + 1, gx = (a.cx / cs) | 0, gy = (a.cy / cs) | 0, Ry = Math.ceil(a.h / cs) + 1;
+      let ok = false;
+      for (let yy = gy - Ry; yy <= gy + Ry && !ok; yy++) for (let xx = gx - R; xx <= gx + R && !ok; xx++) {
+        const lst = g0.get(yy * gw0 + xx); if (!lst) continue;
+        for (const j of lst) { const b = pre[j]; if (b === a) continue;
+          if (Math.max(a.h, b.h) > 1.5 * Math.min(a.h, b.h) || Math.abs(a.cy - b.cy) > 0.35 * Math.max(a.h, b.h)) continue;
+          const gap = Math.max(a.x0, b.x0) - Math.min(a.x1, b.x1); if (gap > 1.5 * Math.max(a.h, b.h) || gap < -0.3 * Math.min(a.w, b.w)) continue;
+          ok = true; break; }
+      }
+      if (ok) { hs.push(a.h); ths.push(a.thick); }
+    });
+    hs.sort((a, b) => a - b); ths.sort((a, b) => a - b);
+    if (ths.length >= 8) thickL = ths[ths.length >> 1];
+    if (hs.length >= 8) L = hs[hs.length >> 1];
+    else { const h2 = pre.map(c => c.h).sort((a, b) => a - b); if (h2.length) L = h2[Math.floor(h2.length * 0.6)]; }
+  }
+  // Trazo largo, fino y torcido: pliegue (una letra, aunque sea "I", "l" o "/", no es más alta que un renglón)
+  const isStroke = c => {
+    const len = c.major, thick = c.area / Math.max(1, len), horiz = c.ang < 3 || c.ang > 177, vert = Math.abs(c.ang - 90) < 12;
+    // una "C" o "(" grande es curva; una "I", "l" o "1" grande es vertical y no más alta que unas pocas letras
+    return len > (vert ? 3.2 : 2.2) * L && thick < sw * 1.9 && len > 6 * thick && !horiz && c.minor < 0.35 * len; // más cortas: ver isDiag
+  };
+  // Mancha maciza (sombra de un pliegue): gruesa y con forma de hoja (llena poco su recuadro). Una "M" negrita o un
+  // cuadrito del QR son gruesos pero llenan su recuadro
+  const isBlob = c => c.thick > Math.max(3.5, thickL + 2, 1.8 * thickL) * Math.max(1, c.h / (1.6 * L)) && c.area / (c.w * c.h) < 0.6;
+  // Raya diagonal fina (marca de pliegue o "/"): se decide aparte, mirando si está entre letras como un "/"
+  const isDiag = c => { const a = c.ang; return c.major <= 2.2 * L && c.major > 3.2 * Math.max(1, c.minor) && ((a > 18 && a < 75) || (a > 105 && a < 162)); };
+  const cand = pre.filter(c => !isStroke(c) && !isBlob(c) && !isDiag(c) && c.h <= 5 * L);
+  // Renglones: unir letras vecinas de alto parecido y centradas a la misma altura (sirve para cualquier tamaño)
+  const cell = Math.max(8, Math.round(L * 2)), gw = Math.ceil(w / cell) + 1, grid = new Map();
+  cand.forEach((c, i) => { const k = ((c.cy / cell) | 0) * gw + ((c.cx / cell) | 0); if (!grid.has(k)) grid.set(k, []); grid.get(k).push(i); });
+  const par = cand.map((_, i) => i), find = i => { while (par[i] !== i) { par[i] = par[par[i]]; i = par[i]; } return i; };
+  const deg = new Uint16Array(cand.length), edges = [];
+  cand.forEach((a, i) => {
+    const R = Math.ceil((a.w / 2 + Math.max(a.h, L) * 3.2 + 2.5 * L) / cell), gx = (a.cx / cell) | 0, gy = (a.cy / cell) | 0; // palabras pegadas: piezas anchas
+    for (let yy = gy - 1; yy <= gy + 1; yy++) for (let xx = gx - R; xx <= gx + R; xx++) {
+      const lst = grid.get(yy * gw + xx); if (!lst) continue;
+      for (const j of lst) {
+        if (j <= i) continue; const b = cand[j];
+        const hr = Math.max(a.h, b.h) / Math.min(a.h, b.h); if (hr > 1.9) continue;
+        const hm = Math.max(a.h, b.h);
+        if (Math.abs(a.cy - b.cy) > 0.42 * hm && Math.abs(a.y1 - b.y1) > 0.25 * hm) continue; // misma línea base o mismo centro
+        const gap = Math.max(a.x0, b.x0) - Math.min(a.x1, b.x1);
+        if (gap > 3.0 * hm) continue;
+        if (gap < -0.5 * Math.min(a.w, b.w)) continue; // encimadas: no son letras vecinas
+        par[find(i)] = find(j); deg[i]++; deg[j]++; edges.push(i, j);
+      }
+    }
+  });
+  const gsize = new Map(); cand.forEach((_, i) => { const r = find(i); gsize.set(r, (gsize.get(r) || 0) + 1); });
+  const groups = new Map();
+  cand.forEach((c, i) => { const r = find(i); if (gsize.get(r) >= 2) { c.keep = 1; c.grp = r; if (!groups.has(r)) groups.set(r, []); groups.get(r).push(c); } });
+  // Gráficos compactos y oscuros (QR, logos, sellos)
+  for (const c of C) {
+    if (c.keep) continue;
+    const fill = c.area / (c.w * c.h);
+    if (c.h > 1.6 * L && c.w > 1.6 * L && fill > 0.28 && c.mn < 0.55 && c.w < c.h * 3 && c.h < c.w * 3 && c.thick <= 0.2 * Math.min(c.w, c.h) + 2) c.keep = 2;
+  }
+  // Rayas de separación: muchas rayitas bajas en una misma fila
+  const dashes = C.filter(c => !c.keep && c.h <= Math.max(sw * 2.6, 0.5 * L) && c.w >= c.h && c.w <= 3 * L && c.mn < 0.75);
+  if (dashes.length >= 3) {
+    dashes.sort((a, b) => a.cy - b.cy);
+    for (let i = 0; i < dashes.length;) {
+      let j = i; while (j + 1 < dashes.length && dashes[j + 1].cy - dashes[i].cy < 0.35 * L) j++;
+      const row = dashes.slice(i, j + 1), span = Math.max(...row.map(c => c.x1)) - Math.min(...row.map(c => c.x0));
+      if (row.length >= 3 && span >= 4 * L) for (const c of row) c.keep = 3;
+      i = j + 1;
+    }
+  }
+  // Líneas rectas impresas (subrayados, recuadros): largas, horizontales y de grosor parejo
+  for (const c of C) if (!c.keep && (c.ang < 2.5 || c.ang > 177.5) && c.w > 2 * L && c.h <= sw * 3.5 && c.mn < 0.6) c.keep = 4;
+  // Franja de cada renglón: se arma con cada par de letras vecinas (sigue renglones curvos y no mezcla renglones
+  // aunque un grupo haya unido dos). Lo que cae dentro puede ser letra pegada a un pliegue.
+  const band = new Int32Array(w * h).fill(-1), hhOf = new Map();
+  for (const [r, g] of groups) hhOf.set(r, g.map(c => c.h).sort((x, y) => x - y)[g.length >> 1]);
+  for (let e = 0; e < edges.length; e += 2) {
+    let a = cand[edges[e]], b = cand[edges[e + 1]]; if (a.cx > b.cx) { const t = a; a = b; b = t; }
+    const hh = hhOf.get(a.grp) || Math.max(a.h, b.h), ok = c => c.h <= 1.35 * hh;
+    // letra con cola de pliegue (más alta que el renglón): se usa la vecina como referencia
+    const A = ok(a) ? a : ok(b) ? b : null, B = ok(b) ? b : ok(a) ? a : null;
+    const xa = Math.max(0, Math.floor(a.cx - a.w / 2 - 0.6 * hh)), xb = Math.min(w - 1, Math.ceil(b.cx + b.w / 2 + 0.6 * hh)), span = Math.max(1, b.cx - a.cx);
+    for (let x = xa; x <= xb; x++) {
+      const t = Math.max(0, Math.min(1, (x - a.cx) / span));
+      let top, bot;
+      if (A && B) { top = A.y0 * (1 - t) + B.y0 * t; bot = A.y1 * (1 - t) + B.y1 * t; const mid = (top + bot) / 2; top = Math.min(top, mid - hh / 2); bot = Math.max(bot, mid + hh / 2); }
+      else { const cy = a.cy * (1 - t) + b.cy * t; top = cy - 0.6 * hh; bot = cy + 0.6 * hh; }
+      const ya = Math.max(0, Math.floor(top - 0.12 * hh)), yb = Math.min(h - 1, Math.ceil(bot + 0.12 * hh));
+      for (let y = ya; y <= yb; y++) band[y * w + x] = 1;
+    }
+  }
+  // "/" de una fecha o de "Placa/Codigo": entre dos letras a la misma altura y muy cerca de ambas
+  const kgrid = new Map(), kc = Math.max(8, Math.round(L * 2)), kgw = Math.ceil(w / kc) + 1;
+  for (const c of C) if (c.keep === 1) { const k = ((c.cy / kc) | 0) * kgw + ((c.cx / kc) | 0); if (!kgrid.has(k)) kgrid.set(k, []); kgrid.get(k).push(c); }
+  const slashOk = c => {
+    let left = false, right = false; const gx = (c.cx / kc) | 0, gy = (c.cy / kc) | 0;
+    for (let yy = gy - 1; yy <= gy + 1; yy++) for (let xx = gx - 2; xx <= gx + 2; xx++) for (const o of kgrid.get(yy * kgw + xx) || []) {
+      if (o.h < 0.55 * c.h || o.h > 1.4 * c.h || Math.abs(o.y1 - c.y1) > 0.3 * c.h) continue;
+      if (o.x1 <= c.x0 + 0.25 * c.w && c.x0 - o.x1 <= 0.6 * c.h) left = true;
+      if (o.x0 >= c.x1 - 0.25 * c.w && o.x0 - c.x1 <= 0.6 * c.h) right = true;
+    }
+    return left && right;
+  };
+  const inB = new Uint32Array(C.length + 1);
+  for (let p = 0; p < w * h; p++) if (lab[p] && band[p] >= 0) inB[lab[p]]++;
+  for (const c of C) {
+    if (c.keep) { if (c.keep === 1 && inB[c.id] < c.area * 0.85) c.clip = 1; continue; } // letra con cola de pliegue: solo lo del renglón
+    if (c.h < minH * 0.5 || !inB[c.id]) continue;
+    const fr = inB[c.id] / c.area; c.fr = fr;
+    if (isBlob(c) || (isDiag(c) && !slashOk(c))) continue;                       // mancha o raya de pliegue
+    if (fr > 0.85 && c.h <= 2.2 * L && !isStroke(c)) { c.keep = 5; continue; }   // suelta dentro del renglón (":", "1", "$", "/")
+    if (fr >= 0.15 && !isStroke(c) && c.mn < 0.62) { c.keep = 6; c.clip = 1; }  // pegada a un pliegue: solo la parte del renglón
+  }
+  const keepId = new Uint8Array(C.length + 1), clipId = new Uint8Array(C.length + 1), bc = new Float32Array(C.length + 1);
+  for (const c of C) { keepId[c.id] = c.keep; clipId[c.id] = c.clip ? 1 : 0; bc[c.id] = c.mn + 0.25 * (c.mean - c.mn); }
+  // Pliegue que atraviesa letras: se quitan los píxeles que forman una línea larga y recta en la dirección de la pieza
+  const cut = new Uint8Array(w * h);
+  for (const c of C) {
+    if (!(c.keep === 6 || (c.keep === 1 && c.clip))) continue;
+    const t = c.ang * Math.PI / 180, dx = Math.cos(t), dy = Math.sin(t), need = 1.3 * L, far = Math.ceil(3 * L);
+    const hit = [];
+    for (let y = c.y0; y <= c.y1; y++) for (let x = c.x0; x <= c.x1; x++) {
+      const p = y * w + x; if (lab[p] !== c.id) continue;
+      let run = 1;
+      for (let sgn = -1; sgn <= 1; sgn += 2) for (let k = 1; k < far; k++) {
+        const xx = Math.round(x + sgn * k * dx), yy = Math.round(y + sgn * k * dy);
+        if (xx < 0 || yy < 0 || xx >= w || yy >= h || lab[yy * w + xx] !== c.id) break; run++;
+      }
+      if (run >= need) hit.push(p);
+    }
+    for (const p of hit) { cut[p] = 1; const x = p % w;
+      for (const q of [p - 1, p + 1, p - w, p + w]) if (q >= 0 && q < w * h && lab[q] === c.id && Math.abs((q % w) - x) <= 1) cut[q] = 1; }
+  }
+  const out = new Uint8Array(w * h), left = new Uint32Array(C.length + 1);
+  for (let p = 0; p < w * h; p++) {
+    const id = lab[p]; if (!id) continue; const k = keepId[id]; if (!k) continue;
+    if (clipId[id] && band[p] < 0) continue;
+    if (cut[p]) continue;
+    out[p] = k; left[id]++;
+  }
+  // lo que queda de una pieza recortada y cortada: si son migajas, era pliegue
+  const crumbs = Math.max(12, 0.15 * L * L);
+  for (let p = 0; p < w * h; p++) { const id = lab[p]; if (out[p] && clipId[id] && left[id] < crumbs) out[p] = 0; }
+  if (typeof window !== 'undefined' && window.__scanDebug) Object.assign(window.__scanDebug, { C, slashOk, kgrid, kc, kgw });
+  return { mask: out, lab, bc, L, comps: C.length, kept: C.filter(c => c.keep).length };
+}
+function scanCleanPrinted(canvas, mode) {
+  const w = canvas.width, h = canvas.height, n = w * h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const id = ctx.getImageData(0, 0, w, h), d = id.data;
+  const g = new Float32Array(n), skin = new Uint8Array(n);
+  const wb = sWhiteGains(d, n); // con luz cálida el papel no debe confundirse con piel ni verse amarillo
+  for (let i = 0; i < n; i++) {
+    const r = Math.min(255, d[i * 4] * wb[0]), gg = Math.min(255, d[i * 4 + 1] * wb[1]), b = Math.min(255, d[i * 4 + 2] * wb[2]);
+    g[i] = 0.299 * r + 0.587 * gg + 0.114 * b; skin[i] = sIsSkin(r, gg, b) || (r > gg && gg > b && r - b > 48 && r > 95) ? 1 : 0;
+  }
+  // Dedos: piel conectada con el borde del recorte
+  const finger = new Uint8Array(n), stack = new Int32Array(n); let sp = 0;
+  const seedF = p => { if (skin[p] && !finger[p]) { finger[p] = 1; stack[sp++] = p; } };
+  // Semillas en una franja junto al borde (el recorte puede dejar una línea de mesa entre el dedo y el borde)
+  const fb = Math.max(2, Math.round(Math.min(w, h) * 0.025));
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (x < fb || y < fb || x >= w - fb || y >= h - fb) seedF(y * w + x);
+  while (sp) { const p = stack[--sp], x = p % w, y = (p / w) | 0;
+    if (x > 0) seedF(p - 1); if (x < w - 1) seedF(p + 1); if (y > 0) seedF(p - w); if (y < h - 1) seedF(p + w); }
+  const q = Math.max(1, Math.round(Math.min(w, h) / 500)), wq = Math.ceil(w / q), hq = Math.ceil(h / q);
+  let fCount = 0; const fq = new Float32Array(wq * hq);
+  for (let i = 0; i < n; i++) if (finger[i]) { fCount++; fq[(((i / w) | 0) / q | 0) * wq + ((i % w) / q | 0)] = 1; }
+  // Dedo: núcleo (se borra), franja cercana (se borra: sombra del dedo) y franja amplia (solo se borra lo que no es tinta)
+  const fGrown = new Uint8Array(n), fBand = new Uint8Array(n);
+  if (fCount) {
+    const rc = Math.max(1, Math.round(w / 250 / q)), fqC = sMorph(fq, wq, hq, rc, true), fqB = sMorph(fq, wq, hq, Math.max(2, Math.round(w / 45 / q)), true);
+    for (let y = 0; y < h; y++) { const row = ((y / q) | 0) * wq; for (let x = 0; x < w; x++) { const j = row + ((x / q) | 0); fGrown[y * w + x] = fqC[j] ? 1 : 0; fBand[y * w + x] = fqB[j] ? 1 : 0; } }
+  }
+  // 1) Luz del papel a baja resolución (sombras amplias, degradados)
+  const gq = new Float32Array(wq * hq);
+  for (let y = 0; y < hq; y++) for (let x = 0; x < wq; x++) { let t = 0, c = 0; for (let yy = y * q; yy < Math.min(h, y * q + q); yy++) for (let xx = x * q; xx < Math.min(w, x * q + q); xx++) { const i = yy * w + xx; t += fBand[i] ? 245 : g[i]; c++; } gq[y * wq + x] = t / c; }
+  const rT = Math.max(3, Math.round(wq * 0.02)); // más ancho que cualquier trazo de letra
+  const closed = sMorph(sMorph(gq, wq, hq, rT, true), wq, hq, Math.round(rT * 0.7), false);
+  const bgq = sBoxBlur(closed, wq, hq, Math.max(2, Math.round(rT * 0.8)));
+  const bgAt = (x, y) => { const fx = Math.max(0, Math.min(wq - 1.001, x / q - 0.5)), fy = Math.max(0, Math.min(hq - 1.001, y / q - 0.5)), x0 = fx | 0, y0 = fy | 0, ax = fx - x0, ay = fy - y0;
+    return (bgq[y0 * wq + x0] * (1 - ax) + bgq[y0 * wq + x0 + 1] * ax) * (1 - ay) + (bgq[(y0 + 1) * wq + x0] * (1 - ax) + bgq[(y0 + 1) * wq + x0 + 1] * ax) * ay; };
+  const bgC = new Float32Array(n), gF = new Float32Array(n), ink0 = new Uint8Array(n);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x, b = Math.max(30, bgAt(x, y)); bgC[i] = b; gF[i] = fGrown[i] ? b : g[i]; ink0[i] = !fGrown[i] && g[i] / b < 0.6 ? 1 : 0; }
+  // 2) Luz fina: sigue cada faceta del papel arrugado (cierre del tamaño de unos pocos trazos)
+  const { sw } = sInkScale(ink0, w, h);
+  const r1 = Math.max(2, Math.min(18, Math.round(sw * 1.7 + 1)));
+  let bgF = sMorph(sMorph(gF, w, h, r1, true), w, h, r1, false);
+  bgF = sBoxBlur(bgF, w, h, Math.max(1, r1 >> 1));
+  const bg = new Float32Array(n), nv = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const b = Math.max(30, bgF[i], g[i], 0.88 * bgC[i]); bg[i] = b; nv[i] = fGrown[i] ? 1 : Math.min(1.1, g[i] / b); }
+  // 3) Umbrales de tinta según lo más oscuro de la factura (las tirillas desteñidas tienen la tinta gris)
+  const hist = new Uint32Array(111); let cnt = 0;
+  for (let i = 0; i < n; i += 2) { if (fGrown[i]) continue; hist[Math.max(0, Math.min(110, Math.round(nv[i] * 100)))]++; cnt++; }
+  const pct = f => { let a = 0; for (let b = 0; b <= 110; b++) { a += hist[b]; if (a >= cnt * f) return b / 100; } return 1; };
+  const p0 = Math.min(0.8, pct(0.004));
+  // Umbrales generosos (no partir letras tenues) y por zona: lo más oscuro de cada zona decide. Un QR muy
+  // negro no vuelve invisible el texto gris de al lado. Lo que no es texto lo quita el paso 4.
+  const tsOf = p => Math.max(0.6, Math.min(0.84, Math.max(0.58 + 0.25 * p, 0.5 + 0.5 * p)));
+  const cs = Math.max(12, Math.round(Math.min(w, h) / 36)), gxn = Math.ceil(w / cs), gyn = Math.ceil(h / cs), Pc = new Float32Array(gxn * gyn);
+  {
+    const hc = new Uint32Array(111);
+    for (let cy = 0; cy < gyn; cy++) for (let cx = 0; cx < gxn; cx++) {
+      hc.fill(0); let c = 0;
+      for (let y = cy * cs; y < Math.min(h, cy * cs + cs); y += 1) for (let x = cx * cs; x < Math.min(w, cx * cs + cs); x += 1) { const i = y * w + x; if (fGrown[i]) continue; hc[Math.max(0, Math.min(110, Math.round(nv[i] * 100)))]++; c++; }
+      let a = 0, pv = 1; if (c) for (let b = 0; b <= 110; b++) { a += hc[b]; if (a >= c * 0.02) { pv = b / 100; break; } }
+      Pc[cy * gxn + cx] = pv;
+    }
+  }
+  const TsC = new Float32Array(gxn * gyn);
+  for (let cy = 0; cy < gyn; cy++) for (let cx = 0; cx < gxn; cx++) {
+    // cada zona con tinta usa su propio nivel; una zona sin tinta toma el de sus vecinas (bordes de letras)
+    let m = Pc[cy * gxn + cx];
+    if (m > 0.8) for (let yy = Math.max(0, cy - 1); yy <= Math.min(gyn - 1, cy + 1); yy++) for (let xx = Math.max(0, cx - 1); xx <= Math.min(gxn - 1, cx + 1); xx++) m = Math.min(m, Pc[yy * gxn + xx]);
+    TsC[cy * gxn + cx] = tsOf(m);
+  }
+  const TsP = new Float32Array(n);
+  for (let y = 0; y < h; y++) {
+    const fy = Math.max(0, Math.min(gyn - 1.001, y / cs - 0.5)), y0 = fy | 0, ay = fy - y0, y1 = Math.min(gyn - 1, y0 + 1);
+    for (let x = 0; x < w; x++) {
+      const fx = Math.max(0, Math.min(gxn - 1.001, x / cs - 0.5)), x0 = fx | 0, ax = fx - x0, x1 = Math.min(gxn - 1, x0 + 1);
+      TsP[y * w + x] = (TsC[y0 * gxn + x0] * (1 - ax) + TsC[y0 * gxn + x1] * ax) * (1 - ay) + (TsC[y1 * gxn + x0] * (1 - ax) + TsC[y1 * gxn + x1] * ax) * ay;
+    }
+  }
+  const Ts = tsOf(p0), Tw = Math.min(0.92, Ts + 0.19); // valores globales, solo para depurar
+  // Enfoque suave: los trazos finos y tenues se oscurecen un poco respecto a su entorno
+  const nvb = sBoxBlur(nv, w, h, 1); for (let i = 0; i < n; i++) if (!fGrown[i]) nv[i] = Math.max(0, nv[i] + 0.6 * (nv[i] - nvb[i]));
+  const strong = new Float32Array(n); for (let i = 0; i < n; i++) strong[i] = nv[i] < TsP[i] ? 1 : 0;
+  const near = sMorph(strong, w, h, Math.max(1, Math.round(sw * 0.6)), true);
+  const ink = new Uint8Array(n); for (let i = 0; i < n; i++) ink[i] = strong[i] || (near[i] && nv[i] < Math.min(0.92, TsP[i] + 0.19)) ? 1 : 0;
+  // 4) Solo lo impreso: letras en renglones, rayas de separación, QR y logos
+  const pm = sPrintedMask(ink, nv, w, h, sw, fGrown);
+  if (typeof window !== 'undefined' && window.__scanDebug) Object.assign(window.__scanDebug, { sw, r1, Ts, Tw, p0, L: pm.L, comps: pm.comps, kept: pm.kept, mask: pm.mask, ink, w, h });
+  // 5) Tinta negra pareja sobre blanco (las letras desteñidas quedan oscuras y legibles)
+  const o = d;
+  for (let i = 0; i < n; i++) {
+    let L = 255;
+    if (pm.mask[i]) { const ts = TsP[i], tw = Math.min(0.92, ts + 0.19), Bi = Math.min(ts - 0.12, Math.max(0.02, pm.bc[pm.lab[i]])); let t = (nv[i] - Bi) / (tw - Bi); t = t < 0 ? 0 : t > 1 ? 1 : t; L = Math.round(Math.pow(t, 1.5) * 255); }
+    if (mode === 'color' && L < 255) {
+      // Color: misma luminosidad del modo mejorado; se conserva el tono original (sellos, logos, tinta azul)
+      const k = 255 / Math.max(30, bg[i]), f = [0, 1, 2].map(c => Math.min(255, d[i * 4 + c] * wb[c] * k)), fl = 0.299 * f[0] + 0.587 * f[1] + 0.114 * f[2];
+      for (let c = 0; c < 3; c++) o[i * 4 + c] = Math.max(0, Math.min(255, Math.round(L + (f[c] - fl) * 1.15 * (1 - L / 255))));
+    } else { o[i * 4] = o[i * 4 + 1] = o[i * 4 + 2] = L; }
+    o[i * 4 + 3] = 255;
+  }
+  // Restos del fondo pegados al borde (franja del 4 %)
+  const band = Math.max(4, Math.round(Math.min(w, h) * 0.04)), band2 = Math.max(2, Math.round(Math.min(w, h) * 0.015)), seen = new Uint8Array(n), st = [];
+  const inBand = (x, y) => x < band || y < band || x >= w - band || y >= h - band;
+  const inBand2 = (x, y) => x < band2 || y < band2 || x >= w - band2 || y >= h - band2;
+  const lum = i => 0.299 * o[i * 4] + 0.587 * o[i * 4 + 1] + 0.114 * o[i * 4 + 2];
+  for (let x = 0; x < w; x++) { st.push(x, (h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { st.push(y * w, y * w + w - 1); }
+  while (st.length) {
+    const i = st.pop(); if (seen[i]) continue; seen[i] = 1;
+    const x = i % w, y = (i / w) | 0;
+    if (lum(i) > 170) {
+      if (inBand2(x, y)) { if (x > 0) st.push(i - 1); if (x < w - 1) st.push(i + 1); if (y > 0) st.push(i - w); if (y < h - 1) st.push(i + w); }
+      continue;
+    }
+    if (!inBand(x, y)) continue;
+    o[i * 4] = o[i * 4 + 1] = o[i * 4 + 2] = 255;
+    if (x > 0) st.push(i - 1); if (x < w - 1) st.push(i + 1); if (y > 0) st.push(i - w); if (y < h - 1) st.push(i + w);
+  }
+  const out = document.createElement('canvas'); out.width = w; out.height = h;
+  out.getContext('2d').putImageData(id, 0, 0);
+  return { canvas: out, fingers: C.sum(Array.from(finger)) };
+}
+
 function scanFlat(res) {
   if (!res || !res.flatSrc) return null;
   let s = res.flatSrc; for (let i = 0; i < 4; i++) { const nx = scanStraighten(s); if (nx === s) break; s = nx; }
-  const r2 = scanClean(s, res.flatMode || 'clean'); r2.canvas = scanTrim(r2.canvas); return r2;
+  const r2 = scanCleanPrinted(s, res.flatMode || 'clean'); r2.canvas = scanTrim(r2.canvas); return r2;
 }
 function scanForOcr(res) {
   const cv = res.canvas, hc = res.charH || 0;
