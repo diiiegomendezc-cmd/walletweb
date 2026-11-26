@@ -296,6 +296,19 @@
     return { interest, capital: amount - interest };
   }
 
+  // Vuelve a repartir todos los abonos (por fecha) después de editar uno o de cambiar el valor prestado.
+  // Devuelve { payments } con interés y capital recalculados, o { error } si los abonos superan lo que se debe.
+  function reallocatePayments(loan) {
+    const list = (loan.payments || []).map((p, i) => ({ p, i })).sort((a, b) => (a.p.date || '').localeCompare(b.p.date || '') || a.i - b.i);
+    const tmp = Object.assign({}, loan, { payments: [] });
+    for (const { p } of list) {
+      const a = allocatePayment(tmp, p.amount);
+      if (a.error) return { error: 'Los abonos superan lo que se debe del préstamo (' + formatMoney(loanSummary(Object.assign({}, loan, { payments: [] }), '0000-00-00').total) + ').' };
+      tmp.payments.push(Object.assign({}, p, a));
+    }
+    return { payments: tmp.payments };
+  }
+
   /* ---------------- Presupuestos ---------------- */
   function budgetBase(b, ctx) {
     if (b.method === 'pctExpected') return mulDivRound(ctx.expectedIncome, b.value, 100);
@@ -1268,7 +1281,7 @@ function papelera(p) {
     setCurrency, CUR, CUR_SYMBOLS, todayISO, nowTime, addDays, diffDays, dow, daysInMonth, monthKey, addMonthsKey, monthDiff, addMonthsISO, monthLabel, MONTHS, iso, parts,
     easter, holidaysCO, holidayName, isBusinessDay, prevBusinessDay, nextBusinessDay, occurrences,
     attributeToPeople, txEffects, isActive, accountBalance, personalAmount, receivableParts, expenseInMonth, incomeInMonth, installmentStatus,
-    loanTotalInterest, loanSchedule, loanSummary, allocatePayment,
+    loanTotalInterest, loanSchedule, loanSummary, allocatePayment, reallocatePayments,
     budgetBase, budgetStatus, budgetActive, budgetUntil, budgetDuration, txMatchesScope, goalSummary, wishPlan, wishMonthly,
     duplicateScore, parsePastedText, parseReceiptText, receiptLinesFromWords, mergeReceiptReads, parseAmountToken, matchMerchant, editDistance, csvSafe, toCSV, parseCSV, parseDateFlexible,
     encryptBackup, decryptBackup, hashPin, b64, unb64,

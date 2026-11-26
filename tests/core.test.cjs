@@ -74,6 +74,11 @@ test('préstamo de 1.000.000 con interés simple y abono parcial', () => {
   const tx = { type: 'repay_in', status: 'confirmed', amount: 300000, interest: 100000, capital: 200000, date: '2026-12-01' };
   assert.equal(C.incomeInMonth(tx, '2026-12'), 100000);
   assert.ok(C.allocatePayment(loan, 900000).error);
+  // editar un abono o el valor prestado: se reparte de nuevo todo, por fecha
+  const ed = { ...loan, payments: [{ date: '2026-12-20', amount: 100000, txId: 'b' }, { date: '2026-12-05', amount: 300000, txId: 'a' }] };
+  const re = C.reallocatePayments(ed);
+  assert.deepEqual(re.payments.map(p => [p.txId, p.interest, p.capital]), [['a', 40000, 260000], ['b', 0, 100000]]); // el interés de la cuota 2 ya lo cubrió el primero
+  assert.ok(C.reallocatePayments({ ...ed, principal: 200000 }).error);
   // vencido
   const late = C.loanSummary(loan, '2027-03-17');
   assert.equal(late.status, 'overdue');

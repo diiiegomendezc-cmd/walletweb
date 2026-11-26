@@ -28,6 +28,7 @@ const ACT = {
   // Movimientos
   newTx: () => openTxForm(),
   txDetail: el => txDetail(el.dataset.id),
+  txEditSimple: el => txEditSimple(el.dataset.id), txEditSimpleSave: el => txEditSimpleSave(el.dataset.id),
   txEdit: async el => { const t = txById(el.dataset.id); await closeSheet(true); openTxForm(null, t); },
   txDup: async el => { const t = txById(el.dataset.id); await closeSheet(true); const d = draftFromTx(t); openTxForm(Object.assign(stripD(d), { id: null, date: today(), time: C.nowTime(), status: 'confirmed', source: 'manual' })); },
   txDelete: el => txDelete(el.dataset.id),

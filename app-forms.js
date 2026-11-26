@@ -632,7 +632,7 @@ function txDetail(id) {
     ${inst ? `<div class="card"><b>Compra a cuotas</b><dl class="kv" style="margin-top:8px"><dt>Cuotas</dt><dd>${inst.n} de ${money(inst.value)}</dd><dt>Cuotas causadas</dt><dd>${inst.paidCount}</dd><dt>Pendientes</dt><dd>${inst.pendingCount} · ${money(inst.pendingAmount)}</dd><dt>Primera cuota</dt><dd>${esc(C.monthLabel(t.installments.firstMonth))}</dd></dl></div>` : ''}
     ${t.receipt ? `<div class="card"><b>Comprobante</b> ${typeof driveReceiptPill === 'function' ? driveReceiptPill(t) : '<span class="pill">En este dispositivo</span>'}<div id="rcptView" style="margin-top:10px" class="muted small">Cargando…</div>${typeof driveReceiptLink === 'function' ? driveReceiptLink(t) : ''}</div>` : ''}`,
     footer: `${t.status !== 'confirmed' ? `<button class="btn primary" data-act="txConfirm" data-id="${t.id}">${ic('check', 'sm')} Confirmar</button>` : ''}
-      ${['expense', 'income', 'transfer', 'adjust'].includes(t.type) ? `<button class="btn" data-act="txEdit" data-id="${t.id}">${ic('edit', 'sm')} Editar</button><button class="btn" data-act="txDup" data-id="${t.id}" aria-label="Duplicar">${ic('copy', 'sm')}</button>` : ''}
+      ${['expense', 'income', 'transfer', 'adjust'].includes(t.type) ? `<button class="btn" data-act="txEdit" data-id="${t.id}">${ic('edit', 'sm')} Editar</button><button class="btn" data-act="txDup" data-id="${t.id}" aria-label="Duplicar">${ic('copy', 'sm')}</button>` : SIMPLE_EDIT.has(t.type) ? `<button class="btn" data-act="txEditSimple" data-id="${t.id}">${ic('edit', 'sm')} Editar</button>` : ''}
       <button class="btn danger" data-act="txDelete" data-id="${t.id}" aria-label="Eliminar">${ic('trash', 'sm')}</button>` });
   if (t.receipt) Promise.all([Store.get('rcpt:' + t.id), Store.get('rcptthumb:' + t.id)]).then(([b, th]) => {
     const el = $('#rcptView'); if (!el) return;
@@ -640,6 +640,58 @@ function txDetail(id) {
     const url = URL.createObjectURL(b), pic = th ? URL.createObjectURL(th) : (b.type.startsWith('image/') ? url : null);
     el.innerHTML = `${pic ? `<button type="button" class="thumb-open" data-act="rcptView" data-id="${t.id}" aria-label="Ver cómo quedó la factura"><img class="thumb" src="${pic}" alt="Factura"></button><div class="small muted vw-tip">Toca la factura para verla completa</div>` : ''}${b.type === 'application/pdf' ? `<button type="button" class="btn block" style="margin-top:10px" data-act="rcptView" data-id="${t.id}">${ic('doc', 'sm')} Ver factura (${Math.round(b.size / 1024)} KB)</button>` : ''}`;
   });
+}
+/* Edición de movimientos que nacen de un préstamo o de un cobro: valor, fecha, cuenta y nota, manteniendo el préstamo
+   (abonos repartidos de nuevo en interés y capital) o el gasto compartido (lo cobrado) en orden. */
+const SIMPLE_EDIT = new Set(['collect', 'repay_in', 'repay_out', 'loan_out', 'loan_in']);
+function txEditSimple(id) {
+  const t = txById(id); if (!t || !SIMPLE_EDIT.has(t.type)) return;
+  const loan = t.loanId ? loanById(t.loanId) : null;
+  const hint = t.type === 'collect' ? 'Cambia lo que quedó cobrado de ese gasto compartido.'
+    : t.type === 'repay_in' || t.type === 'repay_out' ? 'El préstamo se actualiza solo: se reparte de nuevo cuánto va a interés y cuánto a capital.'
+    : 'Cambia también el préstamo' + (loan ? ' con ' + personName(loan.personId) : '') + ': el valor prestado, la fecha y la cuenta.';
+  const accs = activeAccounts().map(a => [a.id, a.name]); if (t.accountId && !accs.some(a => a[0] === t.accountId) && accById(t.accountId)) accs.push([t.accountId, accById(t.accountId).name]);
+  openSheet({ id: 'txs', title: 'Editar ' + TYPES[t.type].toLowerCase(), body: `<p class="hint" style="margin:0 0 14px">${esc(hint)}</p>
+    <div class="field"><label for="tsA">Valor</label><input id="tsA" class="input" inputmode="decimal" value="${t.amount}" autocomplete="off"></div>
+    <div class="field"><label for="tsAcc">Cuenta</label><select id="tsAcc" class="input">${optionList(accs, t.accountId, 'Elegir cuenta…')}</select></div>
+    <div class="field"><label for="tsD">Fecha</label><input id="tsD" type="date" class="input" value="${esc(t.date)}"></div>
+    <div class="field"><label for="tsN">Nota</label><input id="tsN" class="input" value="${esc(t.note || '')}" autocomplete="off"></div>
+    <div id="tsErr" class="err" role="alert"></div>`,
+    footer: `<button class="btn primary" data-act="txEditSimpleSave" data-id="${t.id}">${ic('check', 'sm')} Guardar cambios</button>` });
+}
+async function txEditSimpleSave(id) {
+  const t = txById(id); if (!t) return;
+  const err = m => { $('#tsErr').textContent = m; };
+  const v = C.evalAmount($('#tsA').value), acc = $('#tsAcc').value, date = $('#tsD').value, note = $('#tsN').value.trim();
+  if (!v || v <= 0) return err('Escribe un valor válido.');
+  if (!accById(acc)) return err('Elige la cuenta.');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return err('Elige la fecha.');
+  const before = { amount: t.amount, date: t.date, accountId: t.accountId };
+  if (t.type === 'collect') {
+    const src = t.refTxId ? txById(t.refTxId) : null, part = src?.split?.parts.find(p => p.personId === t.personId);
+    if (part) {
+      const max = part.amount - Math.max(0, (part.collected || 0) - t.amount);
+      if (v > max) return err('Supera lo que te debía de ese gasto (' + C.formatMoney(max) + ').');
+      part.collected = Math.max(0, (part.collected || 0) - t.amount) + v;
+    }
+  } else {
+    const l = loanById(t.loanId);
+    if (l) {
+      const isLoan = t.type === 'loan_out' || t.type === 'loan_in';
+      const draft = Object.assign({}, l, isLoan ? { principal: v } : {}, { payments: (l.payments || []).map(p => p.txId === t.id ? Object.assign({}, p, { amount: v, date, accountId: acc, note }) : p) });
+      const re = C.reallocatePayments(draft);
+      if (re.error) return err(re.error);
+      if (isLoan) { l.principal = v; l.startDate = date; l.accountId = acc; }
+      l.payments = re.payments;
+      for (const p of l.payments) { const pt = p.txId && txById(p.txId); if (pt) { pt.interest = p.interest; pt.capital = p.capital; } }
+    }
+  }
+  Object.assign(t, { amount: v, date, accountId: acc, note, updatedAt: new Date().toISOString(), version: (t.version || 1) + 1 });
+  const ch = ['amount', 'date', 'accountId'].filter(k => before[k] !== t[k]);
+  audit('transaction.updated', 'transaction', t.id, `${TYPES[t.type]} editado${ch.length ? ': ' + ch.map(k => ({ amount: 'valor', date: 'fecha', accountId: 'cuenta' })[k]).join(', ') : ''}`);
+  save(); await closeSheet(true); await closeSheet(true);
+  if (sheets.length && sheets[sheets.length - 1].id === 'loanD' && t.loanId) { await closeSheet(true); render(); loanDetail(t.loanId); } else render(); // el préstamo abierto debajo se muestra actualizado
+  txDetail(t.id); toast('Cambios guardados');
 }
 async function txDelete(id) {
   const t = txById(id); if (!t) return;
